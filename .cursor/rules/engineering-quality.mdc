@@ -1,0 +1,232 @@
+---
+description: Professional engineering, security, and code-quality standards
+alwaysApply: true
+---
+
+# Professional Engineering Standards
+
+## 1. Understand Before Changing
+
+
+• Inspect the existing project structure and relevant files before implementing changes..
+• Follow the established architecture, naming conventions, patterns, and framework versions..
+• Reuse existing components, utilities, services, and dependencies where appropriate..
+• If requirements are ambiguous or a change could be destructive, ask for clarification before proceeding..
+• Never claim to have inspected files, run commands, or verified behavior unless you actually did so..
+
+## 2. Professional Planning
+
+
+• For substantial features, first analyze the requirements and prepare a concise implementation plan..
+• Identify affected modules, files, APIs, database tables, dependencies, and potential risks..
+• Identify the tests and verification steps required..
+• Avoid unnecessary details and repetitive analysis..
+• Implement the approved plan across the necessary modules while keeping responsibilities clearly separated..
+• Do not put an entire feature into one file when the project architecture calls for separate modules..
+• Avoid unrelated refactoring and scope expansion..
+• Do not repeatedly reanalyze the entire codebase when targeted inspection is sufficient..
+
+## 3. Architecture and Code Quality
+
+
+• Follow the existing project architecture and established design patterns..
+• Write readable, maintainable, modular, and appropriately typed code..
+• Use clear separation of concerns between UI, business logic, API, and data access..
+• Keep functions and modules focused on specific responsibilities..
+• Prefer existing abstractions when they are appropriate..
+• Avoid duplicated code and unnecessary complexity..
+• Follow SOLID principles where applicable without overengineering..
+• Avoid premature optimization and unnecessary design patterns..
+• Handle errors explicitly and consistently..
+• Use meaningful names for variables, functions, classes, and files..
+• Avoid magic values when named constants or configuration are more appropriate..
+• Add comments only when they explain intent or non-obvious behavior..
+• Never rewrite working code without a clear technical reason..
+
+## 4. Security by Default
+
+
+• Treat all external input as untrusted..
+• Validate input at appropriate application boundaries..
+• Enforce authentication and authorization on the server..
+• Never rely exclusively on frontend validation or client-side access controls..
+• Apply the principle of least privilege..
+• Use parameterized database queries or safe ORM patterns to prevent injection..
+• Never hardcode passwords, API keys, access tokens, private keys, or secrets..
+• Read secrets from approved environment variables or secret-management systems..
+• Never expose server secrets in browser bundles or public API responses..
+• Never log passwords, tokens, credentials, or sensitive personal information..
+• Use secure password hashing and established authentication mechanisms..
+• Never invent custom cryptographic algorithms..
+• Consider SQL injection, XSS, CSRF, broken access control, SSRF, and unsafe file uploads where relevant..
+• Apply appropriate rate limiting to sensitive endpoints..
+• Use secure cookie and session settings when applicable..
+• Avoid exposing stack traces or sensitive internal details to end users..
+• Do not disable security controls simply to make tests pass..
+• Follow the security conventions and framework-specific protections already established by the project..
+
+## 5. Database and Data Safety
+
+
+• Inspect the existing database schema and migration conventions before making changes..
+• Reuse existing tables, relations, and indexes where appropriate..
+• Avoid duplicate tables, columns, models, or migrations..
+• Prefer additive and backward-compatible migrations when practical..
+• Never drop, truncate, reset, or overwrite existing data unless explicitly requested and confirmed..
+• Never reset a production database as part of routine development..
+• Keep migrations focused on the requested change..
+• Consider constraints, indexes, transactions, and rollback implications..
+• Validate important business rules at the appropriate application and database layers..
+• Avoid N+1 queries and unnecessarily expensive database operations..
+• Use transactions when multiple operations must succeed or fail together..
+• Do not run destructive database commands without explicit authorization..
+
+## 6. API and Backend Engineering
+
+
+• Follow existing API conventions and response structures..
+• Validate request parameters, request bodies, and relevant headers..
+• Enforce authorization for every protected operation..
+• Return appropriate HTTP status codes..
+• Use consistent error handling..
+• Avoid exposing internal database errors or sensitive implementation details..
+• Prevent mass-assignment vulnerabilities where applicable..
+• Implement pagination for potentially large result sets..
+• Consider rate limiting, timeouts, retries, and idempotency where appropriate..
+• Keep controllers and route handlers focused..
+• Put reusable business logic in the project's established service or domain layers..
+• Avoid duplicating business logic across endpoints..
+• Do not introduce new architectural layers without a clear benefit..
+
+## 7. Frontend and Next.js Standards
+
+
+• Follow the existing Next.js architecture and routing conventions..
+• Respect the project's current App Router or Pages Router implementation..
+• Use Server Components and Client Components appropriately when using the App Router..
+• Keep secrets and privileged operations on the server..
+• Never expose private environment variables to client-side code..
+• Avoid unnecessary client-side state and effects..
+• Reuse existing components, hooks, and utilities..
+• Handle loading, empty, success, and error states appropriately..
+• Implement appropriate form validation and accessible UI behavior..
+• Follow responsive-design and accessibility conventions already used by the project..
+• Avoid unnecessary re-renders and expensive client-side operations..
+• Preserve existing UI behavior unless the requirements explicitly call for a change..
+• Do not replace established libraries or styling systems without a clear reason..
+
+## 8. Dependencies and Configuration
+
+
+• Prefer existing dependencies over adding new packages..
+• Add a dependency only when it provides a clear benefit..
+• Check compatibility with the current framework and runtime..
+• Do not change framework versions, package managers, or lockfiles unnecessarily..
+• Do not introduce duplicate libraries for functionality already available..
+• Never commit secrets, credentials, or machine-specific configuration..
+• Preserve existing environment-variable naming conventions..
+• Document new environment variables without including secret values..
+
+## 9. Performance and Scalability
+
+
+• Avoid unnecessary database queries and repeated network requests..
+• Consider indexing for frequently queried database fields..
+• Use pagination or batching for large datasets..
+• Avoid loading entire datasets into memory when unnecessary..
+• Use caching only when its invalidation and consistency requirements are understood..
+• Avoid unnecessary background jobs, queues, and infrastructure..
+• Consider concurrency and race conditions for operations that modify shared state..
+• Optimize based on identifiable bottlenecks rather than assumptions..
+• Preserve correctness and security when making performance improvements..
+
+## 10. Testing and Verification
+
+
+• Add or update tests for changed functionality..
+• Cover important edge cases and failure scenarios..
+• Test authorization and validation for security-sensitive operations..
+• Run relevant unit and integration tests when available..
+• Run lint, type checks, and build checks when feasible..
+• Verify database migrations using the project's established workflow..
+• Inspect the final diff for accidental changes and unrelated edits..
+• Fix failures caused by your changes when practical..
+• Never claim that a test passed unless it actually completed successfully..
+• Clearly report checks that could not be run and explain why..
+• Do not modify tests merely to hide a genuine implementation failure..
+
+## 11. Git and Change Management
+
+
+• Modify only files necessary for the requested task..
+• Preserve unrelated user changes..
+• Never overwrite existing work without understanding its purpose..
+• Do not run destructive Git commands without explicit authorization..
+• Avoid unnecessary formatting changes across unrelated files..
+• Review the final diff before completing the task..
+• Identify generated files and ensure they are handled according to project conventions..
+• Do not commit or push changes unless explicitly requested..
+
+## 12. Error Handling and Reliability
+
+
+• Handle expected failures explicitly..
+• Use consistent error-handling conventions..
+• Avoid silently swallowing exceptions..
+• Do not expose sensitive data in error messages..
+• Consider timeouts and failure handling for external services..
+• Make retries safe for operations that could otherwise execute twice..
+• Avoid introducing breaking changes to existing API contracts..
+• Preserve backward compatibility when practical..
+• Do not hide errors by returning fake success responses..
+
+## 13. Professional Implementation Workflow
+
+For substantial features, follow this workflow:
+
+
+1. Understand the requirements..
+2. Inspect the existing architecture and relevant files..
+3. Identify reusable components and existing functionality..
+4. Prepare a concise implementation plan..
+5. Identify security risks and database implications..
+6. Implement the approved feature across the appropriate modules..
+7. Add or update relevant tests..
+8. Run available verification commands..
+9. Review the final diff..
+10. Summarize the implementation and any remaining risks..
+
+Implement the complete approved feature without requesting approval for every individual file.
+
+However, ask for clarification or authorization before destructive operations, security-sensitive architectural changes, or actions that could cause data loss.
+
+## 14. Final Response Requirements
+
+At the end of each substantial task, report:
+
+
+• What was implemented..
+• Which important files or modules changed..
+• Any database migrations or environment variables required..
+• Which tests and checks were actually run..
+• The actual results of those checks..
+• Any known limitations, unresolved errors, or security concerns..
+• Any required manual steps..
+
+Keep the final summary concise and technically accurate.
+
+Never claim that implementation, testing, deployment, or verification is complete unless the relevant work was actually performed.
+
+## 15. Core Engineering Principles
+
+
+• Security before convenience..
+• Correctness before optimization..
+• Reuse before duplication..
+• Small, focused changes before unnecessary rewrites..
+• Clear architecture before adding complexity..
+• Explicit validation before trusting external input..
+• Tests and evidence before claiming success..
+• Preserve existing data and user changes..
+• Follow the project's established conventions..
+• Deliver maintainable software rather than merely generating code..

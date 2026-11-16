@@ -1,0 +1,14 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: hera
+      POSTGRES_PASSWORD: hera
+      POSTGRES_DB: hera
+    ports:
+      - "5436:5432"
+    volumes:
+      - hera_pg:/var/lib/postgresql/data
+
+volumes:
+  hera_pg:
