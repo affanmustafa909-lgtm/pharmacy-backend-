@@ -1,5 +1,5 @@
 import type { AuthUser } from '../lib/auth.js'
-import { isExpired } from '../lib/expiry.js'
+import { isExpired, parseExpiry } from '../lib/expiry.js'
 import { prisma } from '../lib/prisma.js'
 import { accessibleStoreIds, loadStoreAccess } from './permissions.js'
 import { normalizeMobileConfig } from './mobileConfig.js'
@@ -175,15 +175,12 @@ export async function buildSnapshot(actor: AuthUser) {
     const threshold = product.lowStockThreshold ?? product.store.lowStockThreshold ?? lowStockThreshold
     return product.stock > 0 && product.stock <= threshold
   }).length
+   const expiryLimit = new Date()
+  expiryLimit.setDate(expiryLimit.getDate() + 60)
   const expiringBatches = batches.filter((batch) => {
-    if (isExpired(batch.expiry) || batch.quantity <= 0) return false
-    const [month, year] = batch.expiry.split('/').map((part) => Number(part))
-    if (!month || !year) return false
-    const fullYear = year < 100 ? 2000 + year : year
-    const expiryDate = new Date(fullYear, month, 0)
-    const in30 = new Date()
-    in30.setDate(in30.getDate() + 30)
-    return expiryDate <= in30
+    if (batch.quantity <= 0 || isExpired(batch.expiry)) return false
+    const expiryDate = parseExpiry(batch.expiry)
+    return expiryDate !== null && expiryDate <= expiryLimit
   }).length
   const ordersTodayCount = orders.filter((order) => order.createdAt.toDateString() === today && order.status !== 'cancelled').length
 

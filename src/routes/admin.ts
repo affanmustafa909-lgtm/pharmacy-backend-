@@ -5,7 +5,7 @@ import multer from 'multer'
 import { z } from 'zod'
 import type { ChargeKind, PercentBase, Prisma } from '@prisma/client'
 import { assertChargeRule } from '../domain/charges.js'
-import { isExpired } from '../lib/expiry.js'
+import { isExpired, isValidExpiry, normalizeExpiry } from '../lib/expiry.js'
 import { HttpError, pageParams } from '../lib/http.js'
 import { prisma } from '../lib/prisma.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
@@ -77,6 +77,19 @@ function rejectExpiredBatch(name: string, expiry?: string | null) {
   if (expiry && isExpired(expiry)) {
     throw new HttpError(400, `${name || 'This batch'} is expired and cannot be sold`, 'EXPIRED')
   }
+}
+
+/**
+ * Checks that an expiry the admin typed can be read, and returns it as YYYY-MM-DD.
+ * An unreadable value (e.g. "abc" or "13/99") is refused, because it would never count as expired.
+ */
+function cleanExpiry(name: string, expiry?: string | null): string | undefined {
+  const raw = String(expiry ?? '').trim()
+  if (!raw) return undefined
+  if (!isValidExpiry(raw)) {
+    throw new HttpError(400, `${name || 'This medicine'} has an invalid expiry date "${raw}". Use YYYY-MM-DD or MM/YY.`, 'INVALID_EXPIRY')
+  }
+  return normalizeExpiry(raw) ?? raw
 }
 
 function zodFail(error: unknown) {
@@ -163,7 +176,8 @@ adminRouter.post('/products', async (req, res, next) => {
   try {
     const body = productInput.parse(req.body)
     await assertStoreAccess(req.user!, body.storeId)
-    rejectExpiredBatch(body.name, body.expiry)
+    const expiry = cleanExpiry(body.name, body.expiry)
+    rejectExpiredBatch(body.name, expiry)
     const sku =
       body.sku?.trim() ||
       `HER-${body.name.replace(/[^a-zA-Z0-9]/g, '').slice(0, 3).toUpperCase().padEnd(3, 'X')}-${Date.now().toString(36).slice(-4).toUpperCase()}`
@@ -182,7 +196,7 @@ adminRouter.post('/products', async (req, res, next) => {
         rxRequired: body.rxRequired ?? false,
         description: body.description ?? 'Added from the admin catalog.',
         batch: body.batch ?? 'NEW-26',
-        expiry: body.expiry ?? '12/27',
+        expiry: expiry ?? '2027-12-31',
         onlineSale: body.onlineSale ?? true,
         held: body.held ?? false,
         lowStockAlerts: body.lowStockAlerts ?? true,
@@ -202,7 +216,9 @@ adminRouter.patch('/products/:id', async (req, res, next) => {
     await assertStoreAccess(req.user!, existing.storeId)
     const patch = productInput.partial().parse(req.body)
     if (patch.storeId) await assertStoreAccess(req.user!, patch.storeId)
-    rejectExpiredBatch(patch.name || existing.name, patch.expiry ?? existing.expiry)
+    // Only the expiry text is checked here. An already-expired medicine can still be edited
+    // (price, stock, hold) and an admin may record a past date; the shop simply cannot sell it.
+    const patchExpiry = patch.expiry != null ? cleanExpiry(patch.name || existing.name, patch.expiry) : undefined
     await prisma.product.update({
       where: { id: existing.id },
       data: {
@@ -219,7 +235,7 @@ adminRouter.patch('/products/:id', async (req, res, next) => {
         ...(patch.sku != null ? { sku: patch.sku } : {}),
         ...(patch.description != null ? { description: patch.description } : {}),
         ...(patch.batch != null ? { batch: patch.batch } : {}),
-        ...(patch.expiry != null ? { expiry: patch.expiry } : {}),
+        ...(patchExpiry ? { expiry: patchExpiry } : {}),
         ...(patch.onlineSale != null ? { onlineSale: patch.onlineSale } : {}),
         ...(patch.held != null ? { held: patch.held } : {}),
         ...(patch.lowStockAlerts != null ? { lowStockAlerts: patch.lowStockAlerts } : {}),
@@ -272,9 +288,30 @@ adminRouter.post('/products/:id/restock', async (req, res, next) => {
     const existing = await prisma.product.findUnique({ where: { id: req.params.id } })
     if (!existing) throw new HttpError(404, 'Medicine not found')
     await assertStoreAccess(req.user!, existing.storeId, { roles: ['OWNER', 'STORE_MANAGER'] })
-    const expiry = body.expiry || existing.expiry
-    rejectExpiredBatch(existing.name, expiry)
-    if (body.batchNumber || body.expiry) {
+    const newExpiry = cleanExpiry(existing.name, body.expiry)
+    const expiry = newExpiry || existing.expiry
+    if (isExpired(expiry)) {
+      throw new HttpError(
+        400,
+        `${existing.name} is expired. Enter a new expiry date for the restocked batch.`,
+        'EXPIRED',
+      )
+    }
+    if (body.batchNumber || newExpiry) {
+      // A product made from the admin form keeps its stock on the product row, with no batch rows.
+      // Give that stock its own batch first, otherwise the new batch would replace it when stock is re-counted.
+      const batchCount = await prisma.inventoryBatch.count({ where: { productId: existing.id } })
+      if (batchCount === 0 && existing.stock > 0) {
+        await prisma.inventoryBatch.create({
+          data: {
+            productId: existing.id,
+            storeId: existing.storeId,
+            batchNumber: existing.batch || `OPEN-${existing.sku}`,
+            quantity: existing.stock,
+            expiry: existing.expiry || '2030-12-31',
+          },
+        })
+      }
       await prisma.inventoryBatch.create({
         data: {
           productId: existing.id,
@@ -294,6 +331,13 @@ adminRouter.post('/products/:id/restock', async (req, res, next) => {
           userId: req.user!.id,
         },
       })
+      // The product row showed an expired date: a fresh batch with a valid date makes it sellable again.
+      if (newExpiry && isExpired(existing.expiry)) {
+        await prisma.product.update({
+          where: { id: existing.id },
+          data: { expiry: newExpiry, ...(body.batchNumber ? { batch: body.batchNumber } : {}) },
+        })
+      }
       const { syncProductStockFromBatches } = await import('../services/inventory.js')
       await syncProductStockFromBatches(existing.id)
     } else {

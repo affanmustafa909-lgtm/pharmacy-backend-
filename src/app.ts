@@ -2,6 +2,7 @@ import cors from 'cors'
 import express from 'express'
 import helmet from 'helmet'
 import path from 'node:path'
+import { adminOrderRouter } from './routes/adminOrders.js'
 import { errorHandler } from './middleware/error.js'
 import { adminRouter } from './routes/admin.js'
 import { authRouter } from './routes/auth.js'
@@ -14,7 +15,7 @@ import { prescriptionRouter } from './routes/prescriptions.js'
 import { reminderRouter } from './routes/reminders.js'
 import { reportRouter } from './routes/reports.js'
 import { teamRouter } from './routes/team.js'
-
+import { stockRouter } from './routes/stock.js'
 export function createApp() {
   const app = express()
   app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }))
@@ -27,12 +28,14 @@ export function createApp() {
   app.use('/auth', authRouter)
   app.use('/catalog', catalogRouter)
   app.use('/orders', customerOrderRouter)
+  app.use('/admin/orders', adminOrderRouter)
   app.use('/addresses', addressRouter)
   app.use('/reminders', reminderRouter)
   app.use('/prescriptions', prescriptionRouter)
   app.use('/notifications', notificationRouter)
   app.use('/admin/products/import', importRouter)
   app.use('/admin/reports', reportRouter)
+  app.use('/admin/stock', stockRouter)
   app.use('/admin', teamRouter)
   app.use('/admin', adminRouter)
   app.use(errorHandler)

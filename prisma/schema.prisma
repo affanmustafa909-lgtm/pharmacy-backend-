@@ -7,6 +7,490 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+model User {
+  id               String                 @id @default(cuid())
+  email            String                 @unique
+  passwordHash     String
+  name             String
+  phone            String                 @default("")
+  city             String                 @default("")
+  role             Role
+  deskRole         DeskRole               @default(ORDER_STAFF)
+  storeId          String?
+  canChangePrice   Boolean                @default(false)
+  canRefund        Boolean                @default(false)
+  createdAt        DateTime               @default(now())
+  audits           AuditLog[]
+  addresses        CustomerAddress[]
+  notifications    CustomerNotification[]
+  threads          MessageThread[]
+  orders           Order[]
+  reviewedRx       Prescription[]         @relation("RxReviewer")
+  invitesSent      StaffInvite[]          @relation("InviteSender")
+  stockAlerts      StockAlert[]
+  stockMovements   StockMovement[]
+  managedStores    Store[]                @relation("StoreManager")
+  pharmacistStores Store[]                @relation("StorePharmacistUser")
+  assignments      StoreAssignment[]
+  store            Store?                 @relation("StaffStore", fields: [storeId], references: [id])
+}
+
+model StoreAssignment {
+  id             String   @id @default(cuid())
+  userId         String
+  storeId        String
+  deskRole       DeskRole
+  canChangePrice Boolean  @default(false)
+  canRefund      Boolean  @default(false)
+  createdAt      DateTime @default(now())
+  store          Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, storeId])
+  @@index([storeId])
+  @@index([userId])
+}
+
+model StaffInvite {
+  id             String       @id @default(cuid())
+  email          String
+  storeId        String
+  deskRole       DeskRole
+  canChangePrice Boolean      @default(false)
+  canRefund      Boolean      @default(false)
+  status         InviteStatus @default(pending)
+  token          String       @unique
+  invitedById    String
+  acceptedUserId String?
+  createdAt      DateTime     @default(now())
+  acceptedAt     DateTime?
+  invitedBy      User         @relation("InviteSender", fields: [invitedById], references: [id])
+  store          Store        @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  @@index([email, status])
+  @@index([storeId])
+}
+
+model CustomerAddress {
+  id         String  @id @default(cuid())
+  customerId String
+  label      String
+  line       String
+  isDefault  Boolean @default(false)
+  customer   User    @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([customerId])
+}
+
+model PromoCode {
+  id        String   @id @default(cuid())
+  code      String   @unique
+  label     String
+  discount  Decimal  @db.Decimal(12, 2)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+}
+
+model Store {
+  id                String                @id @default(cuid())
+  code              String                @unique
+  name              String
+  address           String
+  openUntil         String
+  weeklyHours       Json                  @default("{}")
+  closedDays        Json                  @default("[]")
+  holidayHours      Json                  @default("[]")
+  mapLat            Float?
+  mapLng            Float?
+  rating            Float                 @default(0)
+  status            StoreStatus           @default(active)
+  isOpen            Boolean               @default(true)
+  acceptingOrders   Boolean               @default(true)
+  phone             String                @default("")
+  pharmacist        String                @default("")
+  managerUserId     String?
+  pharmacistUserId  String?
+  lowStockThreshold Int                   @default(12)
+  createdAt         DateTime              @default(now())
+  audits            AuditLog[]
+  chargeRules       ChargeRule[]
+  batches           InventoryBatch[]
+  orders            Order[]
+  prescriptions     Prescription[]
+  products          Product[]
+  riders            Rider[]
+  services          Service[]
+  invites           StaffInvite[]
+  stockAlerts       StockAlert[]
+  stockMovements    StockMovement[]
+  managerUser       User?                 @relation("StoreManager", fields: [managerUserId], references: [id])
+  pharmacistUser    User?                 @relation("StorePharmacistUser", fields: [pharmacistUserId], references: [id])
+  assignments       StoreAssignment[]
+  deliveryOptions   StoreDeliveryOption[]
+  staff             User[]                @relation("StaffStore")
+}
+
+model StoreDeliveryOption {
+  id           String  @id @default(cuid())
+  storeId      String
+  type         String
+  label        String
+  available    Boolean @default(true)
+  fee          Decimal @db.Decimal(12, 2)
+  etaMinutes   Int     @default(45)
+  deliveryArea String  @default("")
+  store        Store   @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  @@unique([storeId, type])
+  @@index([storeId])
+}
+
+model Rider {
+  id        String   @id @default(cuid())
+  storeId   String
+  name      String
+  phone     String   @default("")
+  vehicle   String   @default("Bike")
+  notes     String   @default("")
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  store     Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  @@index([storeId, active])
+}
+
+model Product {
+  id                String           @id @default(cuid())
+  storeId           String
+  sku               String
+  name              String
+  brand             String           @default("hera.")
+  genericName       String           @default("")
+  strength          String           @default("")
+  category          String           @default("Medicines")
+  unitLabel         String           @default("1 unit")
+  description       String           @default("")
+  imageUrl          String           @default("")
+  price             Decimal          @db.Decimal(12, 2)
+  stock             Int              @default(0)
+  batch             String           @default("")
+  expiry            String           @default("")
+  held              Boolean          @default(false)
+  onlineSale        Boolean          @default(true)
+  published         Boolean          @default(true)
+  rxRequired        Boolean          @default(false)
+  lowStockAlerts    Boolean          @default(true)
+  lowStockThreshold Int?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+  batches           InventoryBatch[]
+  orderItems        OrderItem[]
+  store             Store            @relation(fields: [storeId], references: [id])
+  stockAlerts       StockAlert[]
+  stockMovements    StockMovement[]
+
+  @@unique([storeId, sku])
+  @@index([storeId])
+  @@index([name])
+  @@index([genericName])
+  @@index([sku])
+}
+
+model InventoryBatch {
+  id          String   @id @default(cuid())
+  productId   String
+  storeId     String
+  batchNumber String
+  quantity    Int
+  expiry      String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @default(now()) @updatedAt
+  product     Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  store       Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@index([storeId, expiry])
+}
+
+model StockMovement {
+  id          String              @id @default(cuid())
+  productId   String
+  storeId     String
+  quantity    Int
+  reason      StockMovementReason
+  note        String              @default("")
+  orderNumber String              @default("")
+  userId      String?
+  createdAt   DateTime            @default(now())
+  product     Product             @relation(fields: [productId], references: [id], onDelete: Cascade)
+  store       Store               @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  user        User?               @relation(fields: [userId], references: [id])
+
+  @@index([productId, createdAt])
+  @@index([storeId, createdAt])
+  @@index([orderNumber, productId, reason])
+}
+
+model Service {
+  id          String       @id @default(cuid())
+  storeId     String
+  name        String
+  description String       @default("")
+  active      Boolean      @default(true)
+  createdAt   DateTime     @default(now())
+  chargeRules ChargeRule[]
+  store       Store        @relation(fields: [storeId], references: [id])
+
+  @@index([storeId])
+}
+
+model ChargeRule {
+  id           String       @id @default(cuid())
+  storeId      String
+  serviceId    String?
+  kind         ChargeKind
+  label        String
+  mode         AmountMode
+  amount       Decimal      @db.Decimal(12, 2)
+  percentBase  PercentBase?
+  deliveryType String?
+  active       Boolean      @default(true)
+  createdAt    DateTime     @default(now())
+  service      Service?     @relation(fields: [serviceId], references: [id])
+  store        Store        @relation(fields: [storeId], references: [id])
+
+  @@index([storeId, kind])
+}
+
+model Order {
+  id                 String          @id @default(cuid())
+  number             String          @unique
+  customerId         String
+  storeId            String
+  status             OrderStatus     @default(placed)
+  paymentStatus      PaymentStatus   @default(paid)
+  channel            String          @default("Mobile app")
+  deliveryType       String
+  paymentLabel       String
+  addressLine        String          @default("")
+  prescriptionNumber String          @default("")
+  cancelReason       String          @default("")
+  refundReason       String          @default("")
+  refundAmount       Decimal         @default(0) @db.Decimal(12, 2)
+  productSubtotal    Decimal         @db.Decimal(12, 2)
+  deliveryCharge     Decimal         @db.Decimal(12, 2)
+  serviceCharge      Decimal         @db.Decimal(12, 2)
+  bfpCharge          Decimal         @db.Decimal(12, 2)
+  discount           Decimal         @default(0) @db.Decimal(12, 2)
+  total              Decimal         @db.Decimal(12, 2)
+  createdAt          DateTime        @default(now())
+  customer           User            @relation(fields: [customerId], references: [id])
+  store              Store           @relation(fields: [storeId], references: [id])
+  activities         OrderActivity[]
+  charges            OrderCharge[]
+  items              OrderItem[]
+
+  @@index([storeId, createdAt])
+  @@index([customerId])
+  @@index([status])
+  @@index([paymentStatus])
+}
+
+model OrderActivity {
+  id        String   @id @default(cuid())
+  orderId   String
+  label     String
+  detail    String   @default("")
+  actor     String   @default("")
+  createdAt DateTime @default(now())
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId, createdAt])
+}
+
+model OrderItem {
+  id        String   @id @default(cuid())
+  orderId   String
+  productId String?
+  name      String
+  sku       String
+  unitPrice Decimal  @db.Decimal(12, 2)
+  quantity  Int
+  lineTotal Decimal  @db.Decimal(12, 2)
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product   Product? @relation(fields: [productId], references: [id])
+}
+
+model OrderCharge {
+  id          String       @id @default(cuid())
+  orderId     String
+  kind        ChargeKind
+  label       String
+  mode        AmountMode
+  rate        Decimal      @db.Decimal(12, 2)
+  percentBase PercentBase?
+  baseAmount  Decimal      @db.Decimal(12, 2)
+  amount      Decimal      @db.Decimal(12, 2)
+  order       Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+}
+
+model Prescription {
+  id            String             @id @default(cuid())
+  number        String             @unique
+  customerId    String
+  customerName  String
+  storeId       String
+  medicineName  String             @default("")
+  prescriber    String             @default("")
+  quantity      String             @default("")
+  imageUrl      String             @default("")
+  imageHash     String             @default("")
+  scannedText   String             @default("")
+  imageReadable Boolean            @default(true)
+  verifiedItems Json               @default("[]")
+  customerNote  String             @default("")
+  status        PrescriptionStatus @default(pending)
+  notes         String             @default("")
+  reviewerId    String?
+  reviewedAt    DateTime?
+  orderNumber   String             @default("")
+  submittedAt   DateTime           @default(now())
+  updatedAt     DateTime           @default(now()) @updatedAt
+  reviewer      User?              @relation("RxReviewer", fields: [reviewerId], references: [id])
+  store         Store              @relation(fields: [storeId], references: [id])
+}
+
+model StockAlert {
+  id          String   @id @default(cuid())
+  customerId  String
+  storeId     String
+  productId   String?
+  sku         String
+  productName String   @default("")
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  customer    User     @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  product     Product? @relation(fields: [productId], references: [id])
+  store       Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+
+  @@unique([customerId, storeId, sku])
+  @@index([storeId, sku, active])
+}
+
+model CustomerNotification {
+  id         String   @id @default(cuid())
+  customerId String
+  type       String
+  title      String
+  body       String
+  data       Json     @default("{}")
+  read       Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  customer   User     @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([customerId, createdAt])
+  @@index([customerId, read])
+}
+
+model Reminder {
+  id           String    @id @default(cuid())
+  customerId   String?
+  customerName String
+  medicine     String
+  time         String
+  frequency    String
+  enabled      Boolean   @default(true)
+  adherence    Int       @default(0)
+  productId    String?
+  orderNumber  String?
+  snoozedUntil DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @default(now()) @updatedAt
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  actorId   String?
+  storeId   String?
+  action    String
+  detail    String   @default("")
+  meta      Json     @default("{}")
+  createdAt DateTime @default(now())
+  actor     User?    @relation(fields: [actorId], references: [id])
+  store     Store?   @relation(fields: [storeId], references: [id])
+
+  @@index([storeId, createdAt])
+  @@index([actorId, createdAt])
+}
+
+model Campaign {
+  id     String  @id @default(cuid())
+  title  String
+  detail String
+  ends   String
+  active Boolean @default(false)
+}
+
+model CareEvent {
+  id        String   @id @default(cuid())
+  title     String
+  dateLabel String
+  points    Int
+  createdAt DateTime @default(now())
+}
+
+model MessageThread {
+  id         String    @id @default(cuid())
+  customerId String
+  online     Boolean   @default(false)
+  unread     Int       @default(0)
+  messages   Message[]
+  customer   User      @relation(fields: [customerId], references: [id])
+}
+
+model Message {
+  id        String        @id @default(cuid())
+  threadId  String
+  from      String
+  text      String
+  at        String
+  createdAt DateTime      @default(now())
+  thread    MessageThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
+}
+
+model Notice {
+  id        String   @id @default(cuid())
+  title     String
+  body      String
+  at        String
+  read      Boolean  @default(false)
+  page      String
+  createdAt DateTime @default(now())
+}
+
+model Payout {
+  id        String   @id @default(cuid())
+  amount    Decimal  @db.Decimal(12, 2)
+  note      String
+  createdAt DateTime @default(now())
+}
+
+model Setting {
+  id                 String  @id @default("default")
+  storeName          String  @default("Hera Pharmacy")
+  alertEmail         Boolean @default(true)
+  lowStockThreshold  Int     @default(12)
+  autoApproveRefills Boolean @default(false)
+  showOutOfStock     Boolean @default(true)
+  carePoints         Int     @default(9570)
+  careTier           String  @default("Gold")
+  memberSince        String  @default("March 2024")
+  pointsToNext       Int     @default(1430)
+  nextTier           String  @default("Platinum")
+  rewardValue        Int     @default(125)
+  mobileConfig       Json    @default("{}")
+}
+
 enum Role {
   ADMIN
   STAFF
@@ -86,488 +570,4 @@ enum StockMovementReason {
   expiry
   manual_adjustment
   import
-}
-
-model User {
-  id              String                 @id @default(cuid())
-  email           String                 @unique
-  passwordHash    String
-  name            String
-  phone           String                 @default("")
-  city            String                 @default("")
-  role            Role
-  deskRole        DeskRole               @default(ORDER_STAFF)
-  storeId         String?
-  store           Store?                 @relation("StaffStore", fields: [storeId], references: [id])
-  canChangePrice  Boolean                @default(false)
-  canRefund       Boolean                @default(false)
-  createdAt       DateTime               @default(now())
-  orders          Order[]
-  threads         MessageThread[]
-  addresses       CustomerAddress[]
-  stockAlerts     StockAlert[]
-  notifications   CustomerNotification[]
-  assignments     StoreAssignment[]
-  invitesSent     StaffInvite[]          @relation("InviteSender")
-  audits          AuditLog[]
-  stockMovements  StockMovement[]
-  reviewedRx      Prescription[]         @relation("RxReviewer")
-  managedStores   Store[]                @relation("StoreManager")
-  pharmacistStores Store[]               @relation("StorePharmacistUser")
-}
-
-model StoreAssignment {
-  id             String   @id @default(cuid())
-  userId         String
-  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  storeId        String
-  store          Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
-  deskRole       DeskRole
-  canChangePrice Boolean  @default(false)
-  canRefund      Boolean  @default(false)
-  createdAt      DateTime @default(now())
-
-  @@unique([userId, storeId])
-  @@index([storeId])
-  @@index([userId])
-}
-
-model StaffInvite {
-  id             String       @id @default(cuid())
-  email          String
-  storeId        String
-  store          Store        @relation(fields: [storeId], references: [id], onDelete: Cascade)
-  deskRole       DeskRole
-  canChangePrice Boolean      @default(false)
-  canRefund      Boolean      @default(false)
-  status         InviteStatus @default(pending)
-  token          String       @unique
-  invitedById    String
-  invitedBy      User         @relation("InviteSender", fields: [invitedById], references: [id])
-  acceptedUserId String?
-  createdAt      DateTime     @default(now())
-  acceptedAt     DateTime?
-
-  @@index([email, status])
-  @@index([storeId])
-}
-
-model CustomerAddress {
-  id         String  @id @default(cuid())
-  customerId String
-  customer   User    @relation(fields: [customerId], references: [id], onDelete: Cascade)
-  label      String
-  line       String
-  isDefault  Boolean @default(false)
-
-  @@index([customerId])
-}
-
-model PromoCode {
-  id        String   @id @default(cuid())
-  code      String   @unique
-  label     String
-  discount  Decimal  @db.Decimal(12, 2)
-  active    Boolean  @default(true)
-  createdAt DateTime @default(now())
-}
-
-model Store {
-  id               String            @id @default(cuid())
-  code             String            @unique
-  name             String
-  address          String
-  openUntil        String
-  weeklyHours      Json              @default("{}")
-  closedDays       Json              @default("[]")
-  holidayHours     Json              @default("[]")
-  mapLat           Float?
-  mapLng           Float?
-  rating           Float             @default(0)
-  status           StoreStatus       @default(active)
-  isOpen           Boolean           @default(true)
-  acceptingOrders  Boolean           @default(true)
-  phone            String            @default("")
-  pharmacist       String            @default("")
-  managerUserId    String?
-  managerUser      User?             @relation("StoreManager", fields: [managerUserId], references: [id])
-  pharmacistUserId String?
-  pharmacistUser   User?             @relation("StorePharmacistUser", fields: [pharmacistUserId], references: [id])
-  lowStockThreshold Int              @default(12)
-  createdAt        DateTime          @default(now())
-  staff            User[]            @relation("StaffStore")
-  products         Product[]
-  services         Service[]
-  chargeRules      ChargeRule[]
-  riders           Rider[]
-  orders           Order[]
-  prescriptions    Prescription[]
-  stockAlerts      StockAlert[]
-  assignments      StoreAssignment[]
-  invites          StaffInvite[]
-  batches          InventoryBatch[]
-  stockMovements   StockMovement[]
-  deliveryOptions  StoreDeliveryOption[]
-  audits           AuditLog[]
-}
-
-model StoreDeliveryOption {
-  id          String  @id @default(cuid())
-  storeId     String
-  store       Store   @relation(fields: [storeId], references: [id], onDelete: Cascade)
-  type        String
-  label       String
-  available   Boolean @default(true)
-  fee         Decimal @db.Decimal(12, 2)
-  etaMinutes  Int     @default(45)
-  deliveryArea String @default("")
-
-  @@unique([storeId, type])
-  @@index([storeId])
-}
-
-model Rider {
-  id        String   @id @default(cuid())
-  storeId   String
-  store     Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
-  name      String
-  phone     String   @default("")
-  vehicle   String   @default("Bike")
-  notes     String   @default("")
-  active    Boolean  @default(true)
-  createdAt DateTime @default(now())
-
-  @@index([storeId, active])
-}
-
-model Product {
-  id                String           @id @default(cuid())
-  storeId           String
-  store             Store            @relation(fields: [storeId], references: [id])
-  sku               String
-  name              String
-  brand             String           @default("hera.")
-  genericName       String           @default("")
-  strength          String           @default("")
-  category          String           @default("Medicines")
-  unitLabel         String           @default("1 unit")
-  description       String           @default("")
-  imageUrl          String           @default("")
-  price             Decimal          @db.Decimal(12, 2)
-  stock             Int              @default(0)
-  batch             String           @default("")
-  expiry            String           @default("")
-  held              Boolean          @default(false)
-  onlineSale        Boolean          @default(true)
-  published         Boolean          @default(true)
-  rxRequired        Boolean          @default(false)
-  lowStockAlerts    Boolean          @default(true)
-  lowStockThreshold Int?
-  createdAt         DateTime         @default(now())
-  updatedAt         DateTime         @updatedAt
-  orderItems        OrderItem[]
-  stockAlerts       StockAlert[]
-  batches           InventoryBatch[]
-  stockMovements    StockMovement[]
-
-  @@unique([storeId, sku])
-  @@index([storeId])
-  @@index([name])
-  @@index([genericName])
-  @@index([sku])
-}
-
-model InventoryBatch {
-  id        String   @id @default(cuid())
-  productId String
-  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
-  storeId   String
-  store     Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
-  batchNumber String
-  quantity  Int
-  expiry    String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @default(now()) @updatedAt
-
-  @@index([productId])
-  @@index([storeId, expiry])
-}
-
-model StockMovement {
-  id        String              @id @default(cuid())
-  productId String
-  product   Product             @relation(fields: [productId], references: [id], onDelete: Cascade)
-  storeId   String
-  store     Store               @relation(fields: [storeId], references: [id], onDelete: Cascade)
-  quantity  Int
-  reason    StockMovementReason
-  note      String              @default("")
-  orderNumber String            @default("")
-  userId    String?
-  user      User?               @relation(fields: [userId], references: [id], onDelete: SetNull)
-  createdAt DateTime            @default(now())
-
-  @@index([productId, createdAt])
-  @@index([storeId, createdAt])
-  @@index([orderNumber, productId, reason])
-}
-
-model Service {
-  id          String       @id @default(cuid())
-  storeId     String
-  store       Store        @relation(fields: [storeId], references: [id])
-  name        String
-  description String       @default("")
-  active      Boolean      @default(true)
-  createdAt   DateTime     @default(now())
-  chargeRules ChargeRule[]
-
-  @@index([storeId])
-}
-
-model ChargeRule {
-  id           String       @id @default(cuid())
-  storeId      String
-  store        Store        @relation(fields: [storeId], references: [id])
-  serviceId    String?
-  service      Service?     @relation(fields: [serviceId], references: [id])
-  kind         ChargeKind
-  label        String
-  mode         AmountMode
-  amount       Decimal      @db.Decimal(12, 2)
-  percentBase  PercentBase?
-  deliveryType String?
-  active       Boolean      @default(true)
-  createdAt    DateTime     @default(now())
-
-  @@index([storeId, kind])
-}
-
-model Order {
-  id                 String        @id @default(cuid())
-  number             String        @unique
-  customerId         String
-  customer           User          @relation(fields: [customerId], references: [id])
-  storeId            String
-  store              Store         @relation(fields: [storeId], references: [id])
-  status             OrderStatus   @default(placed)
-  paymentStatus      PaymentStatus @default(paid)
-  channel            String        @default("Mobile app")
-  deliveryType       String
-  paymentLabel       String
-  addressLine        String        @default("")
-  prescriptionNumber String        @default("")
-  cancelReason       String        @default("")
-  refundReason       String        @default("")
-  refundAmount       Decimal       @default(0) @db.Decimal(12, 2)
-  productSubtotal    Decimal       @db.Decimal(12, 2)
-  deliveryCharge     Decimal       @db.Decimal(12, 2)
-  serviceCharge      Decimal       @db.Decimal(12, 2)
-  bfpCharge          Decimal       @db.Decimal(12, 2)
-  discount           Decimal       @default(0) @db.Decimal(12, 2)
-  total              Decimal       @db.Decimal(12, 2)
-  createdAt          DateTime      @default(now())
-  items              OrderItem[]
-  charges            OrderCharge[]
-  activities         OrderActivity[]
-
-  @@index([storeId, createdAt])
-  @@index([customerId])
-  @@index([status])
-  @@index([paymentStatus])
-}
-
-model OrderActivity {
-  id        String   @id @default(cuid())
-  orderId   String
-  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  label     String
-  detail    String   @default("")
-  actor     String   @default("")
-  createdAt DateTime @default(now())
-
-  @@index([orderId, createdAt])
-}
-
-model OrderItem {
-  id        String   @id @default(cuid())
-  orderId   String
-  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  productId String?
-  product   Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
-  name      String
-  sku       String
-  unitPrice Decimal  @db.Decimal(12, 2)
-  quantity  Int
-  lineTotal Decimal  @db.Decimal(12, 2)
-}
-
-model OrderCharge {
-  id          String       @id @default(cuid())
-  orderId     String
-  order       Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  kind        ChargeKind
-  label       String
-  mode        AmountMode
-  rate        Decimal      @db.Decimal(12, 2)
-  percentBase PercentBase?
-  baseAmount  Decimal      @db.Decimal(12, 2)
-  amount      Decimal      @db.Decimal(12, 2)
-}
-
-model Prescription {
-  id            String             @id @default(cuid())
-  number        String             @unique
-  customerId    String
-  customerName  String
-  storeId       String
-  store         Store              @relation(fields: [storeId], references: [id])
-  medicineName  String             @default("")
-  prescriber    String             @default("")
-  quantity      String             @default("")
-  imageUrl      String             @default("")
-  imageHash     String             @default("")
-  scannedText   String             @default("")
-  imageReadable Boolean            @default(true)
-  verifiedItems Json               @default("[]")
-  customerNote  String             @default("")
-  status        PrescriptionStatus @default(pending)
-  notes         String             @default("")
-  reviewerId    String?
-  reviewer      User?              @relation("RxReviewer", fields: [reviewerId], references: [id])
-  reviewedAt    DateTime?
-  orderNumber   String             @default("")
-  submittedAt   DateTime           @default(now())
-  updatedAt     DateTime           @default(now()) @updatedAt
-}
-
-model StockAlert {
-  id          String   @id @default(cuid())
-  customerId  String
-  customer    User     @relation(fields: [customerId], references: [id], onDelete: Cascade)
-  storeId     String
-  store       Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
-  productId   String?
-  product     Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
-  sku         String
-  productName String   @default("")
-  active      Boolean  @default(true)
-  createdAt   DateTime @default(now())
-
-  @@unique([customerId, storeId, sku])
-  @@index([storeId, sku, active])
-}
-
-model CustomerNotification {
-  id         String   @id @default(cuid())
-  customerId String
-  customer   User     @relation(fields: [customerId], references: [id], onDelete: Cascade)
-  type       String
-  title      String
-  body       String
-  data       Json     @default("{}")
-  read       Boolean  @default(false)
-  createdAt  DateTime @default(now())
-
-  @@index([customerId, createdAt])
-  @@index([customerId, read])
-}
-
-model Reminder {
-  id           String    @id @default(cuid())
-  customerId   String?
-  customerName String
-  medicine     String
-  time         String
-  frequency    String
-  enabled      Boolean   @default(true)
-  adherence    Int       @default(0)
-  productId    String?
-  orderNumber  String?
-  snoozedUntil DateTime?
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @default(now()) @updatedAt
-}
-
-model AuditLog {
-  id        String   @id @default(cuid())
-  actorId   String?
-  actor     User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
-  storeId   String?
-  store     Store?   @relation(fields: [storeId], references: [id], onDelete: SetNull)
-  action    String
-  detail    String   @default("")
-  meta      Json     @default("{}")
-  createdAt DateTime @default(now())
-
-  @@index([storeId, createdAt])
-  @@index([actorId, createdAt])
-}
-
-model Campaign {
-  id     String  @id @default(cuid())
-  title  String
-  detail String
-  ends   String
-  active Boolean @default(false)
-}
-
-model CareEvent {
-  id        String   @id @default(cuid())
-  title     String
-  dateLabel String
-  points    Int
-  createdAt DateTime @default(now())
-}
-
-model MessageThread {
-  id         String    @id @default(cuid())
-  customerId String
-  customer   User      @relation(fields: [customerId], references: [id])
-  online     Boolean   @default(false)
-  unread     Int       @default(0)
-  messages   Message[]
-}
-
-model Message {
-  id        String        @id @default(cuid())
-  threadId  String
-  thread    MessageThread @relation(fields: [threadId], references: [id], onDelete: Cascade)
-  from      String
-  text      String
-  at        String
-  createdAt DateTime      @default(now())
-}
-
-model Notice {
-  id        String   @id @default(cuid())
-  title     String
-  body      String
-  at        String
-  read      Boolean  @default(false)
-  page      String
-  createdAt DateTime @default(now())
-}
-
-model Payout {
-  id        String   @id @default(cuid())
-  amount    Decimal  @db.Decimal(12, 2)
-  note      String
-  createdAt DateTime @default(now())
-}
-
-model Setting {
-  id                 String  @id @default("default")
-  storeName          String  @default("Hera Pharmacy")
-  alertEmail         Boolean @default(true)
-  lowStockThreshold  Int     @default(12)
-  autoApproveRefills Boolean @default(false)
-  showOutOfStock     Boolean @default(true)
-  carePoints         Int     @default(9570)
-  careTier           String  @default("Gold")
-  memberSince        String  @default("March 2024")
-  pointsToNext       Int     @default(1430)
-  nextTier           String  @default("Platinum")
-  rewardValue        Int     @default(125)
-  mobileConfig       Json    @default("{}")
 }

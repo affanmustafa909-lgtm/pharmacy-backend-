@@ -249,8 +249,7 @@ export async function placeOrder(input: {
       },
     })
     return created
-  })
-
+   }, { maxWait: 10000, timeout: 30000 })
   await notifyCustomer({
     customerId: input.customerId,
     type: 'order',

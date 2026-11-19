@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import ExcelJS from 'exceljs'
-import { isExpired } from '../lib/expiry.js'
+import { isExpired, isValidExpiry, normalizeExpiry } from '../lib/expiry.js'
 import { prisma } from '../lib/prisma.js'
 import { HttpError } from '../lib/http.js'
 
@@ -222,8 +222,10 @@ export async function previewRows(
     if (!name) errors.push('Name is required')
     if (!Number.isFinite(price) || price < 0) errors.push('Price must be zero or more')
     if (!Number.isFinite(stock)) errors.push('Stock must be a whole number')
-    const expiry = read('expiry')
-    if (expiry && isExpired(expiry)) errors.push('Expiry date is in the past')
+    const expiryRaw = read('expiry')
+    const expiry = normalizeExpiry(expiryRaw) ?? ''
+    if (expiryRaw && !isValidExpiry(expiryRaw)) errors.push(`Expiry date "${expiryRaw}" is not readable (use YYYY-MM-DD or MM/YY)`)
+    else if (expiry && isExpired(expiry)) errors.push('Expiry date is in the past')
     let duplicate = false
     if (store && sku) {
       const key = `${store.id}:${sku.toLowerCase()}`

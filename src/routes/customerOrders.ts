@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { z } from 'zod'
 import { HttpError } from '../lib/http.js'
+import { isExpired } from '../lib/expiry.js'
 import { prisma } from '../lib/prisma.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
 import { money } from '../services/money.js'
@@ -127,6 +128,67 @@ customerOrderRouter.get('/mine', async (req, res) => {
   })
 })
 
+customerOrderRouter.post('/:number/cancel', async (req, res, next) => {
+  try {
+    const order = await prisma.order.findFirst({
+      where: { number: req.params.number, customerId: req.user!.id },
+      include: { items: true },
+    })
+    if (!order) throw new HttpError(404, 'Order not found')
+    if (order.status !== 'placed') throw new HttpError(400, 'This order can no longer be cancelled')
+
+    await prisma.$transaction(
+      async (tx) => {
+        const claimed = await tx.order.updateMany({
+          where: { id: order.id, status: 'placed' },
+          data: { status: 'cancelled', cancelReason: 'Cancelled by customer' },
+        })
+        if (claimed.count !== 1) throw new HttpError(409, 'Order status just changed')
+
+        for (const item of order.items) {
+          if (!item.productId) continue
+          await tx.product.update({
+            where: { id: item.productId },
+            data: { stock: { increment: item.quantity } },
+          })
+          await tx.stockMovement.create({
+            data: {
+              productId: item.productId,
+              storeId: order.storeId,
+              quantity: item.quantity,
+              reason: 'cancellation_release',
+              orderNumber: order.number,
+              note: 'Customer cancelled order',
+              userId: null,
+            },
+          })
+          const batches = await tx.inventoryBatch.findMany({
+            where: { productId: item.productId },
+            orderBy: { expiry: 'asc' },
+          })
+          const target = batches.find((b) => !isExpired(b.expiry))
+          if (target) {
+            await tx.inventoryBatch.update({
+              where: { id: target.id },
+              data: { quantity: { increment: item.quantity } },
+            })
+          }
+        }
+        await tx.orderActivity.create({
+          data: { orderId: order.id, label: 'Order cancelled', detail: 'Cancelled by customer', actor: 'Customer' },
+        })
+        await tx.notice.create({
+          data: { title: 'Order cancelled', body: `${order.number} was cancelled by the customer.`, at: 'Just now', page: 'orders' },
+        })
+      },
+      { maxWait: 10000, timeout: 30000 },
+    )
+    res.json({ id: order.number, status: 'cancelled' })
+  } catch (error) {
+    next(error)
+  }
+})
+
 customerOrderRouter.post('/buy-again', async (req, res, next) => {
   try {
     const body = z
@@ -153,9 +215,6 @@ customerOrderRouter.get('/:number/receipt', async (req, res, next) => {
       include: { items: true, charges: true, store: true },
     })
     if (!order) throw new HttpError(404, 'Order not found')
-    if (!['delivered', 'ready_for_pickup'].includes(order.status) && order.status !== 'placed') {
-      // Allow receipts for completed-ish orders; also placed for demo download after success
-    }
     const detail = mapOrderDetail(order)
     const format = String(req.query.format ?? 'json')
     if (format === 'html') {
