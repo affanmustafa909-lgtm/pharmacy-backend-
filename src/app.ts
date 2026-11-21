@@ -13,6 +13,7 @@ import { notificationRouter } from './routes/notifications.js'
 import { prescriptionRouter } from './routes/prescriptions.js'
 import { reminderRouter } from './routes/reminders.js'
 import { reportRouter } from './routes/reports.js'
+import { riderRouter } from './routes/rider.js'
 import { teamRouter } from './routes/team.js'
 
 export function createApp() {
@@ -31,6 +32,7 @@ export function createApp() {
   app.use('/reminders', reminderRouter)
   app.use('/prescriptions', prescriptionRouter)
   app.use('/notifications', notificationRouter)
+  app.use('/rider', riderRouter)
   app.use('/admin/products/import', importRouter)
   app.use('/admin/reports', reportRouter)
   app.use('/admin', teamRouter)

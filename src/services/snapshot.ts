@@ -4,6 +4,7 @@ import { prisma } from '../lib/prisma.js'
 import { accessibleStoreIds, loadStoreAccess } from './permissions.js'
 import { normalizeMobileConfig } from './mobileConfig.js'
 import { money } from './money.js'
+import { DEFAULT_MAX_DELIVERY_DISTANCE_KM, resolveStoreCity } from '../domain/deliveryArea.js'
 
 const TIERS = {
   Silver: [
@@ -71,12 +72,26 @@ export async function buildSnapshot(actor: AuthUser) {
       prisma.product.findMany({ where: storeFilter, include: { store: true }, orderBy: { name: 'asc' }, take: 200 }),
       prisma.order.findMany({
         where: storeFilter,
-        include: { customer: true, store: true, items: true, charges: true, activities: { orderBy: { createdAt: 'asc' } } },
+        include: {
+          customer: true,
+          store: true,
+          rider: true,
+          items: true,
+          charges: true,
+          activities: { orderBy: { createdAt: 'asc' } },
+        },
         orderBy: { createdAt: 'desc' },
         take: 200,
       }),
       prisma.prescription.findMany({ where: storeFilter, include: { store: true, reviewer: true }, orderBy: { submittedAt: 'desc' }, take: 100 }),
-      prisma.user.findMany({ where: { role: 'CUSTOMER' }, include: { orders: { where: storeFilter } }, orderBy: { name: 'asc' } }),
+      prisma.user.findMany({
+        where: { role: 'CUSTOMER' },
+        include: {
+          orders: { where: storeFilter },
+          addresses: { orderBy: [{ isDefault: 'desc' }, { label: 'asc' }] },
+        },
+        orderBy: { createdAt: 'desc' },
+      }),
       prisma.reminder.findMany({ orderBy: { medicine: 'asc' } }),
       prisma.campaign.findMany(),
       prisma.careEvent.findMany({ orderBy: { createdAt: 'desc' }, take: 20 }),
@@ -88,6 +103,23 @@ export async function buildSnapshot(actor: AuthUser) {
       prisma.inventoryBatch.findMany({ where: storeFilter, take: 500 }),
     ])
 
+  const customerLogins = customers.length
+    ? await prisma.auditLog.findMany({
+        where: {
+          action: 'customer.login',
+          actorId: { in: customers.map((customer) => customer.id) },
+        },
+        orderBy: { createdAt: 'desc' },
+        distinct: ['actorId'],
+        select: { actorId: true, createdAt: true },
+      })
+    : []
+
+  const lastLoginByCustomer = new Map(
+    customerLogins
+      .filter((item) => item.actorId)
+      .map((item) => [item.actorId!, item.createdAt.toISOString()]),
+  )
   const now = new Date()
   const thisMonth = monthKey(now)
   const prev = new Date(now.getFullYear(), now.getMonth() - 1, 1)
@@ -225,6 +257,9 @@ export async function buildSnapshot(actor: AuthUser) {
       customerPhone: order.customer.phone,
       pharmacyId: order.storeId,
       pharmacyName: order.store.name,
+      riderId: order.riderId,
+      riderName: order.rider?.name ?? null,
+      riderPhone: order.rider?.phone ?? null,
       itemSummary: order.items.map((item) => `${item.name} × ${item.quantity}`).join(', '),
       items: order.items.map((item) => ({
         name: item.name,
@@ -238,8 +273,10 @@ export async function buildSnapshot(actor: AuthUser) {
       paymentStatus: order.paymentStatus,
       channel: order.channel,
       deliveryType: order.deliveryType,
+      deliveryDistanceKm: order.deliveryDistanceKm,
       paymentLabel: order.paymentLabel,
       addressLine: order.addressLine,
+      prescriptionNumber: order.prescriptionNumber,
       cancelReason: order.cancelReason,
       refundReason: order.refundReason,
       refundAmount: money(order.refundAmount),
@@ -312,20 +349,38 @@ export async function buildSnapshot(actor: AuthUser) {
     })),
     customers: customers.map((customer) => ({
       id: customer.id,
+      lastLogin: lastLoginByCustomer.get(customer.id) ?? null,
       name: customer.name,
       email: customer.email,
       phone: customer.phone,
-      city: customer.city,
+      city: customer.city || customer.addresses[0]?.city || '',
+      dateOfBirth: customer.dateOfBirth,
+      gender: customer.gender,
+      allergies: customer.allergies,
+      addresses: customer.addresses.map((addr) => ({
+        id: addr.id,
+        label: addr.label,
+        line: addr.line,
+        street: addr.street,
+        subCity: addr.subCity,
+        city: addr.city,
+        state: addr.state,
+        country: addr.country,
+        postalCode: addr.postalCode,
+      })),
       orders: customer.orders.length,
       spend: customer.orders.reduce((sum, order) => sum + (order.status === 'cancelled' ? 0 : money(order.total)), 0),
-      status: customer.orders.length > 0 ? 'active' : 'inactive',
-      since: customer.createdAt.toLocaleDateString('en-US', { month: 'short', year: 'numeric' }),
+      status: 'active',
+      since: customer.createdAt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
     })),
     pharmacies: stores.map((store) => ({
       id: store.id,
       code: store.code,
       name: store.name,
       address: store.address,
+      city: resolveStoreCity(store),
+      country: store.country || '',
+      maxDeliveryDistanceKm: store.maxDeliveryDistanceKm ?? DEFAULT_MAX_DELIVERY_DISTANCE_KM,
       openUntil: store.openUntil,
       weeklyHours: store.weeklyHours,
       closedDays: store.closedDays,
@@ -359,6 +414,9 @@ export async function buildSnapshot(actor: AuthUser) {
         amount: money(rule.amount),
         percentBase: rule.percentBase,
         deliveryType: rule.deliveryType,
+        minDistanceKm: rule.minDistanceKm,
+        maxDistanceKm: rule.maxDistanceKm,
+        perKmRate: rule.perKmRate != null ? money(rule.perKmRate) : null,
       })),
     })),
     reminders,
