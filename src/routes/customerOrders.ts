@@ -5,6 +5,7 @@ import { isExpired } from '../lib/expiry.js'
 import { prisma } from '../lib/prisma.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
 import { money } from '../services/money.js'
+import { listOrderMessages, postOrderMessage } from '../services/orderMessages.js'
 import { mapOrderDetail, placeOrder, quoteOrder, receiptHtml, recheckBuyAgain } from '../services/orders.js'
 
 const itemsSchema = z
@@ -15,6 +16,7 @@ const itemsSchema = z
 const quoteSchema = z.object({
   storeId: z.string().min(1),
   deliveryType: z.enum(['standard', 'express', 'pickup']),
+  addressId: z.string().min(1).optional(),
   promoCode: z.string().trim().max(40).optional(),
   prescriptionNumber: z.string().trim().max(40).optional(),
   items: itemsSchema,
@@ -49,6 +51,7 @@ customerOrderRouter.post('/quote', async (req, res, next) => {
       etaMinutes,
       storeName: quoted.store.name,
       storeAddress: quoted.store.address,
+      deliveryDistanceKm: quoted.deliveryDistanceKm,
       openUntil: quoted.store.openUntil,
       requiresPrescription: quoted.lines.some((line) => line.product.rxRequired),
     })
@@ -74,9 +77,18 @@ customerOrderRouter.post('/', async (req, res, next) => {
       createdAt: order.createdAt.toISOString(),
       productSubtotal: money(order.productSubtotal),
       deliveryCharge: money(order.deliveryCharge),
+      deliveryDistanceKm: order.deliveryDistanceKm,
       serviceCharge: money(order.serviceCharge),
       bfpCharge: money(order.bfpCharge),
       discount: money(order.discount),
+      rider: order.rider
+        ? {
+            id: order.rider.id,
+            name: order.rider.name,
+            phone: order.rider.phone,
+            vehicle: order.rider.vehicle,
+          }
+        : null,
       charges: order.charges.map((charge) => ({
         kind: charge.kind,
         label: charge.label,
@@ -208,11 +220,57 @@ customerOrderRouter.post('/buy-again', async (req, res, next) => {
   }
 })
 
+customerOrderRouter.get('/:number/messages', async (req, res, next) => {
+  try {
+    const order = await prisma.order.findFirst({
+      where: { number: req.params.number, customerId: req.user!.id },
+      include: { rider: true },
+    })
+    if (!order) throw new HttpError(404, 'Order not found')
+    const messages = await listOrderMessages(order.id)
+    res.json({
+      orderNumber: order.number,
+      riderName: order.rider?.name ?? null,
+      riderPhone: order.rider?.phone ?? null,
+      messages,
+    })
+  } catch (error) {
+    next(error)
+  }
+})
+
+customerOrderRouter.post('/:number/messages', async (req, res, next) => {
+  try {
+    const body = z.object({ body: z.string().trim().min(1).max(500) }).parse(req.body)
+    const order = await prisma.order.findFirst({
+      where: { number: req.params.number, customerId: req.user!.id },
+      include: { rider: true, customer: { select: { name: true } } },
+    })
+    if (!order) throw new HttpError(404, 'Order not found')
+    if (!order.riderId) {
+      throw new HttpError(409, 'A rider is not assigned to this order yet')
+    }
+    const message = await postOrderMessage({
+      orderId: order.id,
+      orderNumber: order.number,
+      senderRole: 'customer',
+      senderName: order.customer.name || req.user!.name,
+      body: body.body,
+      customerId: order.customerId,
+      riderId: order.riderId,
+      riderUserId: order.rider?.userId,
+    })
+    res.status(201).json({ message })
+  } catch (error) {
+    next(error instanceof z.ZodError ? new HttpError(400, 'Type a short message') : error)
+  }
+})
+
 customerOrderRouter.get('/:number/receipt', async (req, res, next) => {
   try {
     const order = await prisma.order.findFirst({
       where: { number: req.params.number, customerId: req.user!.id },
-      include: { items: true, charges: true, store: true },
+      include: { items: true, charges: true, store: true, rider: true },
     })
     if (!order) throw new HttpError(404, 'Order not found')
     const detail = mapOrderDetail(order)
@@ -231,7 +289,7 @@ customerOrderRouter.get('/:number', async (req, res, next) => {
   try {
     const order = await prisma.order.findFirst({
       where: { number: req.params.number, customerId: req.user!.id },
-      include: { items: true, charges: true, store: true },
+      include: { items: true, charges: true, store: true, rider: true },
     })
     if (!order) throw new HttpError(404, 'Order not found')
     res.json(mapOrderDetail(order))

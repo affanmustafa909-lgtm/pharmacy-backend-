@@ -18,3 +18,23 @@ export async function notifyCustomer(input: {
     },
   })
 }
+
+export async function notifyRiderInbox(input: {
+  riderId: string
+  userId?: string | null
+  type: string
+  title: string
+  body: string
+  data?: Prisma.InputJsonValue
+}) {
+  return prisma.riderNotification.create({
+    data: {
+      riderId: input.riderId,
+      userId: input.userId ?? null,
+      type: input.type,
+      title: input.title,
+      body: input.body,
+      data: input.data ?? {},
+    },
+  })
+}

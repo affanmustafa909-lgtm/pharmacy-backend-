@@ -1,10 +1,14 @@
 import type { ChargeRule, Prisma } from '@prisma/client'
 import { calculateCharges, type ChargeRuleInput } from '../domain/charges.js'
+import { ENFORCE_OUT_OF_CITY_BLOCK, validateDeliveryCity } from '../domain/deliveryArea.js'
 import { isExpired } from '../lib/expiry.js'
 import { HttpError } from '../lib/http.js'
 import { prisma } from '../lib/prisma.js'
-import { notifyCustomer } from './notifications.js'
+import { notifyCustomer, notifyRiderInbox } from './notifications.js'
+import { getDeliveryDistanceKm } from './distance.js'
+import { formatAddressLine, geocodeStructuredAddress } from './geocode.js'
 import { dec, money } from './money.js'
+import { findAssignedRiderForStore } from './riders.js'
 
 export type DeliveryType = 'standard' | 'express' | 'pickup'
 
@@ -16,6 +20,9 @@ export function toRule(rule: ChargeRule): ChargeRuleInput {
     amount: money(rule.amount),
     percentBase: rule.percentBase,
     deliveryType: rule.deliveryType,
+    minDistanceKm: rule.minDistanceKm,
+    maxDistanceKm: rule.maxDistanceKm,
+    perKmRate: rule.perKmRate != null ? money(rule.perKmRate) : null,
     active: rule.active,
   }
 }
@@ -33,6 +40,7 @@ function matchesVerified(productName: string, sku: string, items: VerifiedItem[]
 
 export async function quoteOrder(input: {
   storeId: string
+  addressId?: string
   deliveryType: DeliveryType
   items: { productId: string; quantity: number }[]
   promoCode?: string
@@ -47,6 +55,95 @@ export async function quoteOrder(input: {
     throw new HttpError(400, 'This store is not accepting app orders right now')
   }
 
+
+  let deliveryDistanceKm: number | null = null
+  let resolvedAddressLine = ''
+
+  if (input.deliveryType !== 'pickup') {
+    if (!input.customerId || !input.addressId) {
+      throw new HttpError(400, 'Select a saved delivery address')
+    }
+
+    const address = await prisma.customerAddress.findFirst({
+      where: { id: input.addressId, customerId: input.customerId },
+    })
+
+    if (!address) {
+      throw new HttpError(400, 'Selected delivery address was not found')
+    }
+
+    resolvedAddressLine = formatAddressLine({
+      street: address.street,
+      subCity: address.subCity,
+      city: address.city,
+      state: address.state,
+      postalCode: address.postalCode,
+      country: address.country,
+      fallback: address.line,
+    })
+
+    let toLat = address.latitude
+    let toLng = address.longitude
+
+    if (toLat == null || toLng == null) {
+      const geocoded = await geocodeStructuredAddress({
+        street: address.street,
+        subCity: address.subCity,
+        city: address.city,
+        state: address.state,
+        postalCode: address.postalCode,
+        country: address.country,
+        line: address.line,
+      })
+      if (geocoded) {
+        toLat = geocoded.latitude
+        toLng = geocoded.longitude
+        await prisma.customerAddress.update({
+          where: { id: address.id },
+          data: { latitude: toLat, longitude: toLng },
+        })
+      }
+    }
+
+    if (
+      toLat == null ||
+      toLng == null ||
+      store.mapLat == null ||
+      store.mapLng == null
+    ) {
+      throw new HttpError(
+        400,
+        'GPS coordinates are missing. Update your delivery place using Search or Current Location.'
+      )
+    }
+
+    deliveryDistanceKm = await getDeliveryDistanceKm({
+      fromLat: store.mapLat,
+      fromLng: store.mapLng,
+      toLat,
+      toLng,
+    })
+
+    const areaCheck = validateDeliveryCity({
+      storeName: store.name,
+      storeCity: store.city,
+      storeAddress: store.address,
+      storeCountry: store.country,
+      maxDeliveryDistanceKm: store.maxDeliveryDistanceKm,
+      customerCity: address.city,
+      customerCountry: address.country,
+      customerLine: address.line,
+      distanceKm: deliveryDistanceKm,
+    })
+
+    if (ENFORCE_OUT_OF_CITY_BLOCK && !areaCheck.allowed) {
+      throw new HttpError(
+        400,
+        areaCheck.reason || 'Sorry, we cannot take out-of-city delivery orders.',
+        'OUT_OF_CITY',
+      )
+    }
+  }
   const products = await prisma.product.findMany({
     where: { id: { in: input.items.map((item) => item.productId) } },
   })
@@ -111,7 +208,12 @@ export async function quoteOrder(input: {
   }
 
   const rules = await prisma.chargeRule.findMany({ where: { storeId: input.storeId, active: true } })
-  const charges = calculateCharges(productSubtotal, input.deliveryType, rules.map(toRule))
+  const charges = calculateCharges(
+    productSubtotal,
+    input.deliveryType,
+    rules.map(toRule),
+    deliveryDistanceKm,
+  )
   let discount = 0
   let promoLabel = ''
   if (input.promoCode?.trim()) {
@@ -126,6 +228,8 @@ export async function quoteOrder(input: {
   return {
     lines,
     store,
+    deliveryDistanceKm,
+    resolvedAddressLine,
     charges: { ...charges, discount, total, promoCode: promoLabel || null },
   }
 }
@@ -134,6 +238,7 @@ export async function placeOrder(input: {
   customerId: string
   customerEmail?: string
   storeId: string
+  addressId?: string
   deliveryType: DeliveryType
   paymentLabel: string
   addressLine: string
@@ -155,6 +260,19 @@ export async function placeOrder(input: {
   }
   input.customerId = customer.id
   const quoted = await quoteOrder({ ...input, enforceRx: true })
+
+  // Delivery orders go to the pharmacy's assigned active rider only.
+  let assignedRider: Awaited<ReturnType<typeof findAssignedRiderForStore>> = null
+  if (input.deliveryType !== 'pickup') {
+    assignedRider = await findAssignedRiderForStore(input.storeId)
+    if (!assignedRider) {
+      throw new HttpError(
+        409,
+        'No active rider is assigned to this pharmacy yet. Please choose another pharmacy or try again later.',
+      )
+    }
+  }
+
   const order = await prisma.$transaction(async (tx) => {
     for (const line of quoted.lines) {
       const updated = await tx.product.updateMany({
@@ -200,12 +318,17 @@ export async function placeOrder(input: {
         number,
         customerId: input.customerId,
         storeId: input.storeId,
+        riderId: assignedRider?.id ?? null,
         status: 'placed',
         paymentStatus: 'paid',
         channel: 'Mobile app',
         deliveryType: input.deliveryType,
         paymentLabel: input.paymentLabel,
-        addressLine: input.deliveryType === 'pickup' ? quoted.store.address : input.addressLine,
+        addressLine:
+          input.deliveryType === 'pickup'
+            ? quoted.store.address
+            : quoted.resolvedAddressLine || input.addressLine,
+        deliveryDistanceKm: quoted.deliveryDistanceKm,
         prescriptionNumber: input.prescriptionNumber ?? '',
         productSubtotal: dec(quoted.charges.productSubtotal),
         deliveryCharge: dec(quoted.charges.deliveryCharge),
@@ -235,19 +358,36 @@ export async function placeOrder(input: {
           })),
         },
         activities: {
-          create: [{ label: 'Order placed', detail: input.deliveryType, actor: 'Customer' }],
+          create: [
+            { label: 'Order placed', detail: input.deliveryType, actor: 'Customer' },
+            ...(assignedRider
+              ? [
+                  {
+                    label: 'Rider assigned',
+                    detail: assignedRider.name,
+                    actor: 'System',
+                  },
+                ]
+              : []),
+          ],
         },
       },
-      include: { items: true, charges: true, store: true },
+      include: { items: true, charges: true, store: true, rider: true },
     })
-    await tx.notice.create({
-      data: {
-        title: 'New app order',
-        body: `${created.number} was placed at ${created.store.name}.`,
-        at: 'Just now',
-        page: 'orders',
-      },
-    })
+
+    // Pickup orders still surface on the pharmacy desk. Delivery orders notify
+    // only the assigned rider for that pharmacy — not a global broadcast.
+    if (input.deliveryType === 'pickup') {
+      await tx.notice.create({
+        data: {
+          title: 'New pickup order',
+          body: `${created.number} was placed at ${created.store.name}.`,
+          at: 'Just now',
+          page: 'orders',
+        },
+      })
+    }
+
     return created
    }, { maxWait: 10000, timeout: 30000 })
   await notifyCustomer({
@@ -257,6 +397,23 @@ export async function placeOrder(input: {
     body: `${order.number} is confirmed at ${order.store.name}.`,
     data: { orderNumber: order.number, status: order.status },
   })
+
+  if (assignedRider) {
+    await notifyRiderInbox({
+      riderId: assignedRider.id,
+      userId: assignedRider.userId,
+      type: 'order',
+      title: 'New delivery order',
+      body: `${order.number} at ${order.store.name} — confirm, pick up the medicine, then deliver to the customer.`,
+      data: {
+        orderNumber: order.number,
+        storeId: order.storeId,
+        status: order.status,
+        action: 'confirm',
+      },
+    })
+  }
+
   return order
 }
 
@@ -319,6 +476,7 @@ export function mapOrderDetail(order: {
   deliveryType: string
   paymentLabel: string
   addressLine: string
+  deliveryDistanceKm: number | null
   createdAt: Date
   productSubtotal: Prisma.Decimal
   deliveryCharge: Prisma.Decimal
@@ -342,6 +500,7 @@ export function mapOrderDetail(order: {
     percentBase: string | null
   }>
   store: { name: string; address: string; openUntil: string; phone: string }
+  rider?: { id: string; name: string; phone: string; vehicle: string } | null
 }) {
   const pickup = order.deliveryType === 'pickup'
   const pickupRank: Record<string, number> = {
@@ -367,10 +526,19 @@ export function mapOrderDetail(order: {
     deliveryType: order.deliveryType,
     paymentLabel: order.paymentLabel,
     addressLine: order.addressLine,
+    deliveryDistanceKm: order.deliveryDistanceKm,
     storeName: order.store.name,
     storeAddress: order.store.address,
     openUntil: order.store.openUntil,
     storePhone: order.store.phone,
+    rider: order.rider
+      ? {
+          id: order.rider.id,
+          name: order.rider.name,
+          phone: order.rider.phone,
+          vehicle: order.rider.vehicle,
+        }
+      : null,
     createdAt: order.createdAt.toISOString(),
     productSubtotal: money(order.productSubtotal),
     deliveryCharge: money(order.deliveryCharge),
@@ -402,9 +570,9 @@ export function mapOrderDetail(order: {
           { id: 'collected', title: 'Collected', completed: completed >= 4 },
         ]
       : [
-          { id: 'confirmed', title: 'Order confirmed', completed: completed >= 1 },
-          { id: 'packed', title: 'Packed at pharmacy', completed: completed >= 2 },
-          { id: 'on_way', title: 'On the way', completed: completed >= 3 },
+          { id: 'confirmed', title: 'Order placed', completed: completed >= 1 },
+          { id: 'packed', title: 'Rider confirmed', completed: completed >= 2 },
+          { id: 'on_way', title: 'Picked up · On the way', completed: completed >= 3 },
           { id: 'delivered', title: 'Delivered', completed: completed >= 4 },
         ],
   }

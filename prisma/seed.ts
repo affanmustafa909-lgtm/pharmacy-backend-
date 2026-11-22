@@ -10,6 +10,7 @@ const prisma = new PrismaClient()
 const DEMO_CODES = ['ALI', 'CTY', 'HCP', 'NEW'] as const
 
 async function wipeAll() {
+  await prisma.orderMessage.deleteMany()
   await prisma.orderActivity.deleteMany()
   await prisma.orderCharge.deleteMany()
   await prisma.orderItem.deleteMany()
@@ -25,6 +26,7 @@ async function wipeAll() {
   await prisma.message.deleteMany()
   await prisma.messageThread.deleteMany()
   await prisma.customerNotification.deleteMany()
+  await prisma.riderNotification.deleteMany()
   await prisma.stockAlert.deleteMany()
   await prisma.prescription.deleteMany()
   await prisma.product.deleteMany()
@@ -273,6 +275,72 @@ async function main() {
     data: { managerUserId: nina.id, pharmacistUserId: nina.id, pharmacist: nina.name },
   })
 
+  const riderPassword = process.env.SEED_RIDER_PASSWORD ?? 'Rider!234'
+  const riderDefs = [
+    { email: 'alex.rider@hera.care', name: 'Alex Rider', storeId: stores.CTY.id, phone: '+1 (212) 555-0142', primary: true },
+    { email: 'sam.rider@hera.care', name: 'Sam Courier', storeId: stores.NEW.id, phone: '+1 (212) 555-0177', primary: true },
+    { email: 'jamie.rider@hera.care', name: 'Jamie Bike', storeId: stores.ALI.id, phone: '+1 (212) 555-0119', primary: true },
+    { email: 'rio.rider@hera.care', name: 'Rio Dash', storeId: stores.HCP.id, phone: '+1 (212) 555-0160', primary: true },
+  ]
+  for (const def of riderDefs) {
+    if (!def.storeId) continue
+    const riderUser = await prisma.user.upsert({
+      where: { email: def.email },
+      create: {
+        email: def.email,
+        name: def.name,
+        phone: def.phone,
+        role: 'RIDER',
+        storeId: def.storeId,
+        passwordHash: await hashPassword(riderPassword),
+      },
+      update: {
+        name: def.name,
+        phone: def.phone,
+        role: 'RIDER',
+        storeId: def.storeId,
+        passwordHash: await hashPassword(riderPassword),
+      },
+    })
+    const existingRider = await prisma.rider.findFirst({ where: { userId: riderUser.id } })
+    if (existingRider) {
+      await prisma.rider.update({
+        where: { id: existingRider.id },
+        data: {
+          storeId: def.storeId,
+          name: def.name,
+          phone: def.phone,
+          active: true,
+          isPrimary: def.primary,
+          vehicle: 'Bike',
+          approvalStatus: 'approved',
+          reviewedAt: new Date(),
+        },
+      })
+    } else {
+      if (def.primary) {
+        await prisma.rider.updateMany({
+          where: { storeId: def.storeId, isPrimary: true },
+          data: { isPrimary: false },
+        })
+      }
+      await prisma.rider.create({
+        data: {
+          storeId: def.storeId,
+          userId: riderUser.id,
+          name: def.name,
+          phone: def.phone,
+          vehicle: 'Bike',
+          active: true,
+          isPrimary: def.primary,
+          notes: 'Seeded pharmacy rider',
+          approvalStatus: 'approved',
+          reviewedAt: new Date(),
+        },
+      })
+    }
+  }
+
   const products = [
     { storeCode: 'ALI', sku: 'HER-CAL-090', name: 'Calcium Care', genericName: 'Calcium carbonate', strength: '600mg', category: 'Supplements', price: 29, unitLabel: '90 tablets', stock: 128, imageUrl: '/uploads/products/HER-CAL-090.jpg', description: 'Calcium with vitamin D3 for bone strength and everyday muscle support.' },
     { storeCode: 'ALI', sku: 'HER-WMV-060', name: 'Women Multivitamin', genericName: 'Multivitamin', strength: 'Daily', category: 'Vitamins', price: 29.99, unitLabel: '60 capsules', stock: 86, imageUrl: '/uploads/products/HER-WMV-060.jpg', description: 'Daily multivitamin for energy, immunity, and hair, skin, and nails.' },
@@ -379,6 +447,7 @@ async function main() {
   const customCount = await prisma.store.count({ where: { code: { notIn: [...DEMO_CODES] } } })
   console.log(`Seeded owner ava@hera.care / ${adminPassword}`)
   console.log(`Seeded NEW manager nina@hera.care / ${managerPassword} (NEW store only)`)
+  console.log(`Seeded riders alex/sam/jamie/rio @hera.care / ${riderPassword}`)
   console.log(`Preserved ${customCount} user-created store(s) outside demo codes ${DEMO_CODES.join(', ')}`)
 }
 
