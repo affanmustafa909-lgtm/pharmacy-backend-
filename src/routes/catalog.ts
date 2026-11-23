@@ -13,8 +13,6 @@ import { sellableStock } from '../services/inventory.js'
 
 export const catalogRouter = Router()
 
-catalogRouter.use(requireAuth, requireRole('CUSTOMER', 'ADMIN', 'STAFF'))
-
 catalogRouter.get('/mobile-config', async (_req, res, next) => {
   try {
     const setting = await prisma.setting.findUnique({
@@ -88,17 +86,17 @@ catalogRouter.get('/stores', async (req, res, next) => {
       orderBy: { name: 'asc' },
     })
 
-    // Staff/admin browse all active stores. Customers only see pharmacies
-    // that can serve their delivery place (city / distance).
+    // Staff/admin browse all active stores. Guests/customers see pharmacies
+    // that can serve their delivery place (city / distance) when known.
     const visible =
-      req.user!.role === 'CUSTOMER'
-        ? await filterStoresAvailableToCustomer(stores, {
-            customerId: req.user!.id,
+      req.user && req.user.role !== 'CUSTOMER'
+        ? stores.map((store) => ({ ...store, deliveryDistanceKm: null as number | null, available: true }))
+        : await filterStoresAvailableToCustomer(stores, {
+            customerId: req.user?.id,
             addressId,
             latitude: Number.isFinite(latitude) ? latitude : null,
             longitude: Number.isFinite(longitude) ? longitude : null,
           })
-        : stores.map((store) => ({ ...store, deliveryDistanceKm: null as number | null, available: true }))
 
     res.json({
       stores: visible.map((store) => ({
@@ -423,7 +421,12 @@ catalogRouter.get('/products/:id/availability', async (req, res, next) => {
   }
 })
 
-catalogRouter.post('/products/:id/notify', async (req, res, next) => {
+catalogRouter.post(
+  '/products/:id/notify',
+  requireAuth,
+  requireRole('CUSTOMER', 'ADMIN', 'STAFF'),
+  async (req, res, next) => {
+
   try {
     const product = await prisma.product.findUnique({
       where: { id: req.params.id },
@@ -479,9 +482,14 @@ catalogRouter.post('/products/:id/notify', async (req, res, next) => {
   } catch (error) {
     next(error)
   }
-})
+},
+)
 
-catalogRouter.delete('/products/:id/notify', async (req, res, next) => {
+catalogRouter.delete(
+  '/products/:id/notify',
+  requireAuth,
+  requireRole('CUSTOMER', 'ADMIN', 'STAFF'),
+  async (req, res, next) => {
   try {
     const product = await prisma.product.findUnique({
       where: { id: req.params.id },
@@ -505,4 +513,5 @@ catalogRouter.delete('/products/:id/notify', async (req, res, next) => {
   } catch (error) {
     next(error)
   }
-})
+},
+)
