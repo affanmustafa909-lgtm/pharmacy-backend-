@@ -7,16 +7,25 @@ import { requireAuth, requireRole } from '../middleware/auth.js'
 import type { AuthUser } from '../lib/auth.js'
 import { assertStoreAccess, accessibleStoreIds } from '../services/permissions.js'
 import { money } from '../services/money.js'
+import { summarizeOrders } from '../services/reportSummary.js'
 
-async function reportStoreScope(user: AuthUser, storeId?: string) {
+/** Each record type is read up to this many rows. If it is hit, the page shows a warning. */
+const ROW_LIMIT = 2000
+/** The Excel file holds at most this many rows. */
+const EXPORT_LIMIT = 5000
+
+/**
+ * Which stores this user may see in the report.
+ * null = every store (owner). [] = no store. Otherwise the list of allowed store ids.
+ * (Before, a manager with several stores only saw the first one. Now they see all of theirs.)
+ */
+async function reportStoreScope(user: AuthUser, storeId?: string): Promise<string[] | null> {
   if (storeId) {
     await assertStoreAccess(user, storeId)
-    return storeId
+    return [storeId]
   }
   const allowed = await accessibleStoreIds(user)
-  if (!allowed) return null
-  if (!allowed.length) return '__none__'
-  return allowed.length === 1 ? allowed[0] : allowed[0]
+  return allowed ?? null
 }
 
 const querySchema = z.object({
@@ -40,16 +49,14 @@ interface ReportRow {
   amount: number
   reference: string
   paymentLabel?: string
+  paymentStatus?: string
   deliveryCharge?: number
   serviceCharge?: number
   bfpCharge?: number
 }
 
-async function collect(userStoreId: string | null, query: z.infer<typeof querySchema>) {
-  if (query.storeId) {
-    if (userStoreId && query.storeId !== userStoreId) throw new HttpError(403, 'You cannot view another store')
-  }
-  const storeId = userStoreId ?? (query.storeId || undefined)
+async function collect(storeIds: string[] | null, query: z.infer<typeof querySchema>) {
+  const storeFilter = storeIds ? { storeId: { in: storeIds } } : {}
   const from = query.from ? new Date(query.from) : undefined
   const to = query.to ? new Date(query.to) : undefined
   if (from && Number.isNaN(from.getTime())) throw new HttpError(400, 'Start date is invalid')
@@ -61,19 +68,21 @@ async function collect(userStoreId: string | null, query: z.infer<typeof querySc
   const orderStatus = orderStatuses.find((status) => status === query.status)
   const paymentMethod = query.paymentMethod?.trim().toLowerCase()
   const rows: ReportRow[] = []
+  let truncated = false
 
   if (type === 'all' || type === 'order' || type === 'charge') {
     const orders = await prisma.order.findMany({
       where: {
-        ...(storeId ? { storeId } : {}),
+        ...storeFilter,
         ...(createdAt ? { createdAt } : {}),
         ...(orderStatus ? { status: orderStatus } : {}),
         ...(query.productId ? { items: { some: { productId: query.productId } } } : {}),
       },
       include: { store: true, customer: true, items: true, charges: true },
       orderBy: { createdAt: 'desc' },
-      take: 2000,
+      take: ROW_LIMIT,
     })
+    if (orders.length >= ROW_LIMIT) truncated = true
     orders.forEach((order) => {
       if (paymentMethod && !order.paymentLabel.toLowerCase().includes(paymentMethod)) return
       if (type === 'all' || type === 'order') {
@@ -87,6 +96,7 @@ async function collect(userStoreId: string | null, query: z.infer<typeof querySc
           amount: money(order.total),
           reference: order.number,
           paymentLabel: order.paymentLabel,
+          paymentStatus: order.paymentStatus,
           deliveryCharge: money(order.deliveryCharge),
           serviceCharge: money(order.serviceCharge),
           bfpCharge: money(order.bfpCharge),
@@ -111,10 +121,11 @@ async function collect(userStoreId: string | null, query: z.infer<typeof querySc
   }
   if (type === 'all' || type === 'prescription') {
     const items = await prisma.prescription.findMany({
-      where: { ...(storeId ? { storeId } : {}), ...(createdAt ? { submittedAt: createdAt } : {}) },
+      where: { ...storeFilter, ...(createdAt ? { submittedAt: createdAt } : {}) },
       include: { store: true },
-      take: 2000,
+      take: ROW_LIMIT,
     })
+    if (items.length >= ROW_LIMIT) truncated = true
     items.forEach((item) => {
       rows.push({
         id: item.id,
@@ -130,10 +141,11 @@ async function collect(userStoreId: string | null, query: z.infer<typeof querySc
   }
   if (type === 'all' || type === 'product') {
     const products = await prisma.product.findMany({
-      where: { ...(storeId ? { storeId } : {}), ...(query.productId ? { id: query.productId } : {}), ...(createdAt ? { createdAt } : {}) },
+      where: { ...storeFilter, ...(query.productId ? { id: query.productId } : {}), ...(createdAt ? { createdAt } : {}) },
       include: { store: true },
-      take: 2000,
+      take: ROW_LIMIT,
     })
+    if (products.length >= ROW_LIMIT) truncated = true
     products.forEach((product) => {
       rows.push({
         id: product.id,
@@ -149,10 +161,11 @@ async function collect(userStoreId: string | null, query: z.infer<typeof querySc
   }
   if (type === 'all' || type === 'service') {
     const services = await prisma.service.findMany({
-      where: { ...(storeId ? { storeId } : {}), ...(createdAt ? { createdAt } : {}) },
+      where: { ...storeFilter, ...(createdAt ? { createdAt } : {}) },
       include: { store: true },
-      take: 2000,
+      take: ROW_LIMIT,
     })
+    if (services.length >= ROW_LIMIT) truncated = true
     services.forEach((service) => {
       rows.push({
         id: service.id,
@@ -167,25 +180,37 @@ async function collect(userStoreId: string | null, query: z.infer<typeof querySc
     })
   }
 
-  return rows
+  const filtered = rows
     .filter((row) => {
       if (query.status && query.status !== 'all' && row.status !== query.status) return false
       if (!q) return true
       return `${row.name} ${row.reference} ${row.storeName} ${row.status}`.toLowerCase().includes(q)
     })
     .sort((a, b) => b.occurredAt.localeCompare(a.occurredAt))
+
+  return { rows: filtered, truncated }
 }
 
 export const reportRouter = Router()
 reportRouter.use(requireAuth, requireRole('ADMIN', 'STAFF'))
 
+// The list and the Excel file both call collect() with the SAME filters,
+// so the exported rows always match what the page shows.
 reportRouter.get('/', async (req, res, next) => {
   try {
     const parsed = querySchema.parse(req.query)
     const scope = await reportStoreScope(req.user!, parsed.storeId)
     const { page, pageSize, skip } = pageParams(req.query as Record<string, unknown>)
-    const rows = await collect(scope, { ...parsed, storeId: parsed.storeId || scope || undefined })
-    res.json({ page, pageSize, total: rows.length, pages: Math.max(1, Math.ceil(rows.length / pageSize)), items: rows.slice(skip, skip + pageSize) })
+    const { rows, truncated } = await collect(scope, parsed)
+    res.json({
+      page,
+      pageSize,
+      total: rows.length,
+      pages: Math.max(1, Math.ceil(rows.length / pageSize)),
+      items: rows.slice(skip, skip + pageSize),
+      summary: summarizeOrders(rows),
+      truncated,
+    })
   } catch (error) {
     next(error instanceof z.ZodError ? new HttpError(400, 'Filters are not valid') : error)
   }
@@ -195,13 +220,74 @@ reportRouter.get('/export', async (req, res, next) => {
   try {
     const parsed = querySchema.parse(req.query)
     const scope = await reportStoreScope(req.user!, parsed.storeId)
-    const rows = await collect(scope, { ...parsed, storeId: parsed.storeId || scope || undefined })
+    const { rows, truncated } = await collect(scope, parsed)
+    const summary = summarizeOrders(rows)
+
+    let storeLabel = scope === null ? 'All stores' : 'All stores you can access'
+    if (parsed.storeId) {
+      const store = await prisma.store.findUnique({ where: { id: parsed.storeId }, select: { name: true } })
+      storeLabel = store?.name ?? parsed.storeId
+    }
+
     const workbook = new ExcelJS.Workbook()
     const sheet = workbook.addWorksheet('Report')
-    sheet.addRow(['When', 'Store', 'Type', 'Status', 'Name', 'Amount', 'Reference'])
-    rows.slice(0, 5000).forEach((row) => {
-      sheet.addRow([row.occurredAt, row.storeName, row.recordType, row.status, row.name, row.amount, row.reference])
+    sheet.addRow([
+      'When',
+      'Store',
+      'Type',
+      'Status',
+      'Name',
+      'Amount',
+      'Reference',
+      'Payment',
+      'Payment status',
+      'Delivery charge',
+      'Service charge',
+      'BFP charge',
+    ])
+    rows.slice(0, EXPORT_LIMIT).forEach((row) => {
+      sheet.addRow([
+        row.occurredAt,
+        row.storeName,
+        row.recordType,
+        row.status,
+        row.name,
+        row.amount,
+        row.reference,
+        row.paymentLabel ?? '',
+        row.paymentStatus ?? '',
+        row.deliveryCharge ?? '',
+        row.serviceCharge ?? '',
+        row.bfpCharge ?? '',
+      ])
     })
+
+    const info = workbook.addWorksheet('Summary')
+    info.addRow(['Filters used'])
+    info.addRow(['Store', storeLabel])
+    info.addRow(['From', parsed.from ?? 'any'])
+    info.addRow(['To', parsed.to ?? 'any'])
+    info.addRow(['Type', parsed.type ?? 'all'])
+    info.addRow(['Status', parsed.status ?? 'any'])
+    info.addRow(['Payment', parsed.paymentMethod ?? 'any'])
+    info.addRow(['Search', parsed.q ?? ''])
+    info.addRow(['Rows in this file', Math.min(rows.length, EXPORT_LIMIT)])
+    info.addRow([])
+    info.addRow(['Order totals (order records matching the filters)', 'Orders', 'Amount'])
+    info.addRow(['Completed (delivered or collected)', summary.completed.count, summary.completed.total])
+    info.addRow(['Cancelled', summary.cancelled.count, summary.cancelled.total])
+    info.addRow(['Unpaid (pending or failed, not cancelled)', summary.unpaid.count, summary.unpaid.total])
+    info.addRow(['Refunded', summary.refunded.count, summary.refunded.total])
+    info.addRow([])
+    info.addRow(['Charges on completed orders'])
+    info.addRow(['Delivery', '', summary.charges.delivery])
+    info.addRow(['Service', '', summary.charges.service])
+    info.addRow(['BFP', '', summary.charges.bfp])
+    if (truncated || rows.length > EXPORT_LIMIT) {
+      info.addRow([])
+      info.addRow(['Warning: there are more records than this file can hold. Narrow the dates or store.'])
+    }
+
     const file = await workbook.xlsx.writeBuffer()
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
     res.setHeader('Content-Disposition', 'attachment; filename="hera-report.xlsx"')

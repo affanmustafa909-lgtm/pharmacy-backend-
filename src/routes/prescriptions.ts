@@ -1,8 +1,9 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { Router } from 'express'
 import fs from 'node:fs'
 import path from 'node:path'
 import multer from 'multer'
+import { Prisma } from '@prisma/client'
 import { z } from 'zod'
 import { HttpError } from '../lib/http.js'
 import { prisma } from '../lib/prisma.js'
@@ -17,7 +18,8 @@ const upload = multer({
     destination: (_req, _file, cb) => cb(null, uploadDir),
     filename: (_req, file, cb) => {
       const ext = path.extname(file.originalname).toLowerCase() || '.jpg'
-      cb(null, `rx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`)
+      // A long random name: the photo link cannot be guessed, because these are patients' prescriptions.
+      cb(null, `rx-${randomBytes(16).toString('hex')}${ext}`)
     },
   }),
   limits: { fileSize: 5 * 1024 * 1024 },
@@ -30,6 +32,12 @@ const upload = multer({
 function hashFile(filePath: string) {
   const bytes = fs.readFileSync(filePath)
   return createHash('sha256').update(bytes).digest('hex')
+}
+
+/** If the request fails after the photo was saved, remove the photo so no orphan file stays on disk. */
+function discardUpload(file?: { filename: string }) {
+  if (!file) return
+  fs.unlink(path.join(uploadDir, file.filename), () => undefined)
 }
 
 function assessReadable(scannedText: string, fileSize: number) {
@@ -133,33 +141,46 @@ prescriptionRouter.post('/', (req, res, next) => {
       if (!store) throw new HttpError(404, 'Store not found')
       if (!req.file) throw new HttpError(400, 'Upload a prescription photo')
       const filePath = path.join(uploadDir, req.file.filename)
-      const imageHash = body.imageHash?.trim() || hashFile(filePath)
+      // The hash always comes from the real saved file. A hash sent by the app is not trusted.
+      const imageHash = hashFile(filePath)
       const scannedText = body.scannedText?.trim() || ''
-      // OCR text is only kept when it is submitted with this upload (same request / matching hash)
+      // OCR text is only kept when it is submitted with this upload (same request)
       const boundText = scannedText
       const readable = assessReadable(boundText, req.file.size)
-      const count = await prisma.prescription.count()
-      const number = `PX-${2200 + count + 1}`
-      const created = await prisma.prescription.create({
-        data: {
-          number,
-          customerId: req.user!.id,
-          customerName: req.user!.name,
-          storeId: body.storeId,
-          medicineName: body.medicineName?.trim() || 'Pending pharmacist review',
-          prescriber: body.prescriber?.trim() || '',
-          quantity: body.quantity?.trim() || '',
-          imageUrl: `/uploads/prescriptions/${req.file.filename}`,
-          imageHash,
-          scannedText: boundText,
-          imageReadable: readable,
-          customerNote: body.customerNote?.trim() || '',
-          status: readable ? 'pending' : 'needs_clearer_photo',
-          notes: readable ? '' : 'Photo looks unreadable. Please replace with a clearer prescription image.',
-          verifiedItems: [],
-        },
-        include: { store: true },
-      })
+
+      // Two uploads at the same moment could pick the same number. If that happens, try the next one.
+      let created: Prisma.PrescriptionGetPayload<{ include: { store: true } }> | null = null
+      for (let attempt = 0; attempt < 5 && !created; attempt += 1) {
+        const count = await prisma.prescription.count()
+        const number = `PX-${2200 + count + 1 + attempt}`
+        try {
+          created = await prisma.prescription.create({
+            data: {
+              number,
+              customerId: req.user!.id,
+              customerName: req.user!.name,
+              storeId: body.storeId,
+              medicineName: body.medicineName?.trim() || 'Pending pharmacist review',
+              prescriber: body.prescriber?.trim() || '',
+              quantity: body.quantity?.trim() || '',
+              imageUrl: `/uploads/prescriptions/${req.file.filename}`,
+              imageHash,
+              scannedText: boundText,
+              imageReadable: readable,
+              customerNote: body.customerNote?.trim() || '',
+              status: readable ? 'pending' : 'needs_clearer_photo',
+              notes: readable ? '' : 'Photo looks unreadable. Please replace with a clearer prescription image.',
+              verifiedItems: [],
+            },
+            include: { store: true },
+          })
+        } catch (error) {
+          const numberTaken = error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002'
+          if (!numberTaken) throw error
+        }
+      }
+      if (!created) throw new HttpError(503, 'Could not save the prescription. Please try again.')
+
       await prisma.notice.create({
         data: {
           title: readable ? 'Prescription to review' : 'Unreadable prescription photo',
@@ -179,6 +200,7 @@ prescriptionRouter.post('/', (req, res, next) => {
       })
       res.status(201).json({ prescription: mapPrescription(created) })
     } catch (error) {
+      discardUpload(req.file)
       next(error instanceof z.ZodError ? new HttpError(400, 'Check the prescription details') : error)
     }
   })
@@ -198,7 +220,7 @@ prescriptionRouter.post('/:number/replace-image', (req, res, next) => {
       }
       if (!req.file) throw new HttpError(400, 'Upload a clearer prescription photo')
       const filePath = path.join(uploadDir, req.file.filename)
-      const imageHash = String(req.body.imageHash ?? '').trim() || hashFile(filePath)
+      const imageHash = hashFile(filePath)
       // Always replace OCR with text from this same upload request — never keep stale OCR from a prior photo
       const scannedText = String(req.body.scannedText ?? '').trim()
       const readable = assessReadable(scannedText, req.file.size)
@@ -235,6 +257,7 @@ prescriptionRouter.post('/:number/replace-image', (req, res, next) => {
       })
       res.json({ prescription: mapPrescription(updated) })
     } catch (error) {
+      discardUpload(req.file)
       next(error)
     }
   })

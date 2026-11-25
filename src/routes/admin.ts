@@ -203,6 +203,13 @@ adminRouter.post('/products', async (req, res, next) => {
         imageUrl: body.imageUrl ?? '',
       },
     })
+    await writeAudit({
+      actorId: req.user!.id,
+      storeId: body.storeId,
+      action: 'product.create',
+      detail: `Added ${created.name} (${created.sku})`,
+      meta: { sku: created.sku, price: body.price, stock: body.stock },
+    })
     res.status(201).json({ id: created.id })
   } catch (error) {
     next(zodFail(error))
@@ -216,9 +223,34 @@ adminRouter.patch('/products/:id', async (req, res, next) => {
     await assertStoreAccess(req.user!, existing.storeId)
     const patch = productInput.partial().parse(req.body)
     if (patch.storeId) await assertStoreAccess(req.user!, patch.storeId)
+    const priceChanged = patch.price != null && patch.price !== money(existing.price)
+    const stockChanged = patch.stock != null && patch.stock !== existing.stock
+    // Price needs the price permission. Stock edits need an owner or a store manager.
+    if (priceChanged) await assertStoreAccess(req.user!, existing.storeId, { requirePrice: true })
+    if (stockChanged) await assertStoreAccess(req.user!, existing.storeId, { roles: ['OWNER', 'STORE_MANAGER'] })
     // Only the expiry text is checked here. An already-expired medicine can still be edited
     // (price, stock, hold) and an admin may record a past date; the shop simply cannot sell it.
     const patchExpiry = patch.expiry != null ? cleanExpiry(patch.name || existing.name, patch.expiry) : undefined
+
+    type Plain = string | number | boolean | null
+    const changes: Record<string, { from: Plain; to: Plain }> = {}
+    const track = (field: string, from: Plain, to: Plain | undefined) => {
+      if (to !== undefined && from !== to) changes[field] = { from, to }
+    }
+    track('name', existing.name, patch.name)
+    track('brand', existing.brand, patch.brand)
+    track('category', existing.category, patch.category)
+    track('unitLabel', existing.unitLabel, patch.unitLabel)
+    track('sku', existing.sku, patch.sku)
+    track('batch', existing.batch, patch.batch)
+    track('expiry', existing.expiry, patchExpiry)
+    track('rxRequired', existing.rxRequired, patch.rxRequired)
+    track('onlineSale', existing.onlineSale, patch.onlineSale)
+    track('held', existing.held, patch.held)
+    track('lowStockAlerts', existing.lowStockAlerts, patch.lowStockAlerts)
+    track('storeId', existing.storeId, patch.storeId)
+    const oldPrice = money(existing.price)
+
     await prisma.product.update({
       where: { id: existing.id },
       data: {
@@ -230,7 +262,7 @@ adminRouter.patch('/products/:id', async (req, res, next) => {
         ...(patch.category != null ? { category: patch.category } : {}),
         ...(patch.price != null ? { price: dec(patch.price) } : {}),
         ...(patch.unitLabel != null ? { unitLabel: patch.unitLabel } : {}),
-        ...(patch.stock != null ? { stock: patch.stock } : {}),
+        // stock is not written here. A stock edit goes through the stock history below.
         ...(patch.rxRequired != null ? { rxRequired: patch.rxRequired } : {}),
         ...(patch.sku != null ? { sku: patch.sku } : {}),
         ...(patch.description != null ? { description: patch.description } : {}),
@@ -242,6 +274,41 @@ adminRouter.patch('/products/:id', async (req, res, next) => {
         ...(patch.imageUrl != null ? { imageUrl: patch.imageUrl } : {}),
       },
     })
+    if (stockChanged && patch.stock != null) {
+      await recordStockMovement({
+        productId: existing.id,
+        storeId: existing.storeId,
+        quantity: patch.stock - existing.stock,
+        reason: 'manual_adjustment',
+        note: `Stock edited in the product form (${existing.stock} to ${patch.stock})`,
+        userId: req.user!.id,
+      })
+      await writeAudit({
+        actorId: req.user!.id,
+        storeId: existing.storeId,
+        action: 'stock.edit',
+        detail: `${existing.name}: stock ${existing.stock} → ${patch.stock}`,
+        meta: { sku: existing.sku, from: existing.stock, to: patch.stock },
+      })
+    }
+    if (priceChanged && patch.price != null) {
+      await writeAudit({
+        actorId: req.user!.id,
+        storeId: existing.storeId,
+        action: 'product.price',
+        detail: `${existing.name}: price ${oldPrice} → ${patch.price}`,
+        meta: { sku: existing.sku, from: oldPrice, to: patch.price },
+      })
+    }
+    if (Object.keys(changes).length > 0) {
+      await writeAudit({
+        actorId: req.user!.id,
+        storeId: existing.storeId,
+        action: 'product.update',
+        detail: `${existing.name}: changed ${Object.keys(changes).join(', ')}`,
+        meta: { sku: existing.sku, changes },
+      })
+    }
     res.status(204).end()
   } catch (error) {
     next(zodFail(error))
@@ -257,6 +324,13 @@ adminRouter.post('/products/:id/deactivate', async (req, res, next) => {
       where: { id: existing.id },
       data: { held: true, onlineSale: false },
     })
+    await writeAudit({
+      actorId: req.user!.id,
+      storeId: existing.storeId,
+      action: 'product.hold',
+      detail: `${existing.name} was deactivated`,
+      meta: { sku: existing.sku },
+    })
     res.status(204).end()
   } catch (error) {
     next(error)
@@ -268,6 +342,13 @@ adminRouter.delete('/products/:id', async (req, res, next) => {
     const existing = await prisma.product.findUnique({ where: { id: req.params.id } })
     if (!existing) throw new HttpError(404, 'Medicine not found')
     await assertStoreAccess(req.user!, existing.storeId)
+    await writeAudit({
+      actorId: req.user!.id,
+      storeId: existing.storeId,
+      action: 'product.delete',
+      detail: `${existing.name} (${existing.sku}) was deleted`,
+      meta: { sku: existing.sku, price: money(existing.price), stock: existing.stock },
+    })
     await prisma.product.delete({ where: { id: existing.id } })
     res.status(204).end()
   } catch (error) {
@@ -646,13 +727,22 @@ adminRouter.post('/orders/:number/status', async (req, res, next) => {
         })
       }
     }
+    if (body.status === 'cancelled' && order.status !== 'cancelled') {
+      await writeAudit({
+        actorId: req.user!.id,
+        storeId: order.storeId,
+        action: 'order.cancel',
+        detail: `${order.number} cancelled`,
+        meta: { from: order.status, reason: body.cancelReason ?? '' },
+      })
+    }
     if (body.refundAmount && body.refundAmount > 0) {
       await writeAudit({
         actorId: req.user!.id,
         storeId: order.storeId,
         action: 'order.refund',
         detail: `Refund ${body.refundAmount} on ${order.number}`,
-        meta: { reason: body.refundReason ?? '' },
+        meta: { order: order.number, amount: body.refundAmount, orderTotal: money(order.total), reason: body.refundReason ?? '' },
       })
     }
     const titles: Record<string, string> = {
@@ -713,6 +803,9 @@ adminRouter.post('/prescriptions/:number/decision', async (req, res, next) => {
     if (!canReviewPrescriptions(access.deskRole) && req.user!.role !== 'ADMIN') {
       throw new HttpError(403, 'Your role cannot review prescriptions')
     }
+    if ((body.status === 'rejected' || body.status === 'needs_clearer_photo') && !body.notes?.trim()) {
+      throw new HttpError(400, 'Add a short reason so the patient knows what to do next')
+    }
     if (prescription.status === 'rejected' || prescription.status === 'dispensed') {
       throw new HttpError(400, 'This prescription is already closed')
     }
@@ -762,8 +855,13 @@ adminRouter.post('/prescriptions/:number/decision', async (req, res, next) => {
       actorId: req.user!.id,
       storeId: prescription.storeId,
       action: 'prescription.review',
-      detail: `${updated.number} → ${body.status}`,
-      meta: { verifiedCount: enrichedItems.length },
+      detail: `${updated.number}: ${prescription.status} → ${body.status}`,
+      meta: {
+        from: prescription.status,
+        to: body.status,
+        verifiedCount: enrichedItems.length,
+        items: enrichedItems.map((item) => ({ sku: item.sku, qty: item.approvedQty })),
+      },
     })
     const titles: Record<string, string> = {
       needs_clearer_photo: 'Clearer photo needed',
@@ -1006,7 +1104,12 @@ adminRouter.patch('/pharmacies/:id', async (req, res, next) => {
       storeId: updated.id,
       action: 'store.update',
       detail: `Updated ${updated.code}`,
-      meta: { status: body.status ?? null, acceptingOrders: body.acceptingOrders ?? null },
+      meta: {
+        status: body.status ?? null,
+        acceptingOrders: body.acceptingOrders ?? null,
+        pharmacistUserId: body.pharmacistUserId ?? null,
+        managerUserId: body.managerUserId ?? null,
+      },
     })
     res.status(204).end()
   } catch (error) {
@@ -1019,14 +1122,24 @@ adminRouter.get('/audit-log', async (req, res, next) => {
     if (req.user!.role !== 'ADMIN') throw new HttpError(403, 'Audit log is owner-only')
     const storeId = String(req.query.storeId ?? '')
     if (storeId) await assertStoreAccess(req.user!, storeId)
+    // Optional filters: ?action=product (matches product.price, product.update ...), ?from=, ?to=, ?limit=
+    const action = String(req.query.action ?? '').trim()
+    const from = req.query.from ? new Date(String(req.query.from)) : undefined
+    const to = req.query.to ? new Date(String(req.query.to)) : undefined
+    if ((from && Number.isNaN(from.getTime())) || (to && Number.isNaN(to.getTime()))) {
+      throw new HttpError(400, 'Date is not valid')
+    }
+    const limit = Math.min(Math.max(Number(req.query.limit) || 200, 1), 500)
     const allowed = await accessibleStoreIds(req.user!)
     const items = await prisma.auditLog.findMany({
       where: {
         ...(storeId ? { storeId } : allowed ? { storeId: { in: allowed } } : {}),
+        ...(action ? { action: { startsWith: action } } : {}),
+        ...(from || to ? { createdAt: { gte: from, lte: to } } : {}),
       },
       include: { actor: true, store: true },
       orderBy: { createdAt: 'desc' },
-      take: 200,
+      take: limit,
     })
     res.json({
       items: items.map((item) => ({

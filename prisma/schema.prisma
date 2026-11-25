@@ -212,6 +212,21 @@ model InventoryBatch {
   @@index([storeId, expiry])
 }
 
+enum StockMovementReason {
+  restock
+  order_fulfillment
+  cancellation_release
+  damage
+  expiry
+  manual_adjustment
+  import
+  opening_balance
+  purchase_receive
+  transfer_out
+  transfer_in
+}
+
+// --- A2. Purane `model StockMovement` ko is se REPLACE karo ---
 model StockMovement {
   id          String              @id @default(cuid())
   productId   String
@@ -221,6 +236,9 @@ model StockMovement {
   note        String              @default("")
   orderNumber String              @default("")
   userId      String?
+  batchNumber String              @default("")
+  unitCost    Decimal?            @db.Decimal(12, 2)
+  requestId   String?             @unique
   createdAt   DateTime            @default(now())
   product     Product             @relation(fields: [productId], references: [id], onDelete: Cascade)
   store       Store               @relation(fields: [storeId], references: [id], onDelete: Cascade)
@@ -229,6 +247,97 @@ model StockMovement {
   @@index([productId, createdAt])
   @@index([storeId, createdAt])
   @@index([orderNumber, productId, reason])
+}
+
+// --- A3. File ke ekdam neeche ye NAYE models/enums add karo ---
+enum PurchaseStatus {
+  draft
+  received
+  cancelled
+}
+
+enum TransferStatus {
+  in_transit
+  received
+}
+
+model Supplier {
+  id        String            @id @default(cuid())
+  storeId   String
+  name      String
+  contact   String            @default("")
+  address   String            @default("")
+  active    Boolean           @default(true)
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @default(now()) @updatedAt
+  invoices  PurchaseInvoice[]
+
+  @@index([storeId, name])
+}
+
+model PurchaseInvoice {
+  id          String            @id @default(cuid())
+  number      String
+  supplierId  String
+  storeId     String
+  status      PurchaseStatus    @default(draft)
+  note        String            @default("")
+  createdById String?
+  receivedAt  DateTime?
+  createdAt   DateTime          @default(now())
+  supplier    Supplier          @relation(fields: [supplierId], references: [id])
+  lines       PurchaseLine[]
+  payments    SupplierPayment[]
+
+  @@unique([storeId, number])
+  @@index([supplierId])
+  @@index([storeId, status])
+}
+
+model PurchaseLine {
+  id          String          @id @default(cuid())
+  invoiceId   String
+  productId   String
+  batchNumber String
+  expiry      String
+  quantity    Int
+  unitCost    Decimal         @db.Decimal(12, 2)
+  invoice     PurchaseInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+}
+
+model SupplierPayment {
+  id         String          @id @default(cuid())
+  invoiceId  String
+  amount     Decimal         @db.Decimal(12, 2)
+  receiptRef String
+  note       String          @default("")
+  userId     String?
+  paidAt     DateTime        @default(now())
+  invoice    PurchaseInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@unique([invoiceId, receiptRef])
+  @@index([invoiceId])
+}
+
+model StockTransfer {
+  id             String         @id @default(cuid())
+  fromStoreId    String
+  toStoreId      String
+  sku            String
+  batchNumber    String
+  expiry         String
+  quantity       Int
+  status         TransferStatus @default(in_transit)
+  requestId      String?        @unique
+  dispatchedById String?
+  receivedById   String?
+  dispatchedAt   DateTime       @default(now())
+  receivedAt     DateTime?
+
+  @@index([fromStoreId, status])
+  @@index([toStoreId, status])
 }
 
 model Service {
@@ -562,12 +671,4 @@ enum PrescriptionStatus {
   rejected
 }
 
-enum StockMovementReason {
-  restock
-  order_fulfillment
-  cancellation_release
-  damage
-  expiry
-  manual_adjustment
-  import
-}
+
