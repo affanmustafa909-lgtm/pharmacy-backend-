@@ -1,5 +1,6 @@
 import type { ChargeRule, Prisma } from '@prisma/client'
-import { calculateCharges, type ChargeRuleInput } from '../domain/charges.js'
+import { calculateCharges, DeliveryRuleConfigurationError, type ChargeRuleInput } from '../domain/charges.js'
+import { getStoreOrderEligibility } from '../domain/storeAvailability.js'
 import { ENFORCE_OUT_OF_CITY_BLOCK, validateDeliveryCity } from '../domain/deliveryArea.js'
 import { isExpired } from '../lib/expiry.js'
 import { HttpError } from '../lib/http.js'
@@ -52,8 +53,13 @@ export async function quoteOrder(input: {
   if (!input.items?.length) throw new HttpError(400, 'Cart is empty', 'EMPTY_CART')
   const store = await prisma.store.findUnique({ where: { id: input.storeId } })
   if (!store) throw new HttpError(404, 'Store not found')
-  if (store.status !== 'active' || !store.isOpen || !store.acceptingOrders) {
-    throw new HttpError(400, 'This store is not accepting app orders right now')
+  const storeEligibility = getStoreOrderEligibility(store)
+  if (!storeEligibility.eligible) {
+    throw new HttpError(
+      400,
+      storeEligibility.reason ?? 'This store is not accepting app orders right now',
+      'STORE_NOT_ACCEPTING_ORDERS',
+    )
   }
 
 
@@ -211,12 +217,20 @@ export async function quoteOrder(input: {
   }
 
   const rules = await prisma.chargeRule.findMany({ where: { storeId: input.storeId, active: true } })
-  const charges = calculateCharges(
-    productSubtotal,
-    input.deliveryType,
-    rules.map(toRule),
-    deliveryDistanceKm,
-  )
+  let charges: ReturnType<typeof calculateCharges>
+  try {
+    charges = calculateCharges(
+      productSubtotal,
+      input.deliveryType,
+      rules.map(toRule),
+      deliveryDistanceKm,
+    )
+  } catch (error) {
+    if (error instanceof DeliveryRuleConfigurationError) {
+      throw new HttpError(400, error.message, 'DELIVERY_RULE_NOT_CONFIGURED')
+    }
+    throw error
+  }
   let discount = 0
   let promoLabel = ''
   if (input.promoCode?.trim()) {
@@ -291,7 +305,7 @@ export async function placeOrder(input: {
         where: { orderNumber: number, productId: line.product.id, reason: 'order_fulfillment' },
       })
       if (existingMove) continue
-      // Leave userId null for customer checkout — stock log is system/order driven, not a desk staff edit.
+      // Leave userId null for customer checkout â€” stock log is system/order driven, not a desk staff edit.
       await tx.stockMovement.create({
         data: {
           productId: line.product.id,
@@ -391,7 +405,7 @@ export async function placeOrder(input: {
     })
 
     // Pickup orders still surface on the pharmacy desk. Delivery orders notify
-    // only the assigned rider for that pharmacy — not a global broadcast.
+    // only the assigned rider for that pharmacy â€” not a global broadcast.
     if (input.deliveryType === 'pickup') {
       await tx.notice.create({
         data: {
@@ -419,7 +433,7 @@ export async function placeOrder(input: {
       userId: assignedRider.userId,
       type: 'order',
       title: 'New delivery order',
-      body: `${order.number} at ${order.store.name} — confirm, pick up the medicine, then deliver to the customer.`,
+      body: `${order.number} at ${order.store.name} â€” confirm, pick up the medicine, then deliver to the customer.`,
       data: {
         orderNumber: order.number,
         storeId: order.storeId,
@@ -908,3 +922,4 @@ export async function placeMultiStoreCheckout(input: {
 }
 
 export type Tx = Prisma.TransactionClient
+

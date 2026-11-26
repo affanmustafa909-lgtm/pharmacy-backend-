@@ -1,6 +1,6 @@
-import assert from 'node:assert/strict'
+﻿import assert from 'node:assert/strict'
 import test from 'node:test'
-import { calculateCharges, type ChargeRuleInput } from './charges.js'
+import { calculateCharges, DeliveryRuleConfigurationError, type ChargeRuleInput } from './charges.js'
 import { validateDeliveryCity } from './deliveryArea.js'
 
 const rules: ChargeRuleInput[] = [
@@ -120,4 +120,52 @@ test('out-of-city delivery orders are rejected by city mismatch or exceeding cit
   })
   assert.equal(tooFar.allowed, false)
   assert.match(tooFar.reason ?? '', /30 km/i)
+})
+
+
+
+test('exact distance boundaries select the correct delivery tier', () => {
+  const tieredRules: ChargeRuleInput[] = [
+    { kind: 'DELIVERY', label: 'Nearby', mode: 'FIXED', amount: 2, percentBase: null, deliveryType: 'standard', minDistanceKm: 0, maxDistanceKm: 3 },
+    { kind: 'DELIVERY', label: 'Mid-range', mode: 'FIXED', amount: 4.5, percentBase: null, deliveryType: 'standard', minDistanceKm: 3, maxDistanceKm: 8 },
+    { kind: 'DELIVERY', label: 'Far', mode: 'FIXED', amount: 7.5, percentBase: null, deliveryType: 'standard', minDistanceKm: 8, maxDistanceKm: null },
+  ]
+
+  const cases = [
+    { distance: 0, expected: 2, label: 'Nearby' },
+    { distance: 2.99, expected: 2, label: 'Nearby' },
+    { distance: 3, expected: 4.5, label: 'Mid-range' },
+    { distance: 7.99, expected: 4.5, label: 'Mid-range' },
+    { distance: 8, expected: 7.5, label: 'Far' },
+  ]
+
+  for (const item of cases) {
+    const result = calculateCharges(30, 'standard', tieredRules, item.distance)
+    assert.equal(result.deliveryCharge, item.expected, `${item.distance} km fee`)
+    assert.equal(result.deliveryZoneLabel, item.label, `${item.distance} km tier`)
+  }
+})
+
+test('a distance gap does not silently fall back to another delivery tier', () => {
+  const gapRules: ChargeRuleInput[] = [
+    { kind: 'DELIVERY', label: 'First', mode: 'FIXED', amount: 2, percentBase: null, deliveryType: 'standard', minDistanceKm: 0, maxDistanceKm: 3 },
+    { kind: 'DELIVERY', label: 'Second', mode: 'FIXED', amount: 5, percentBase: null, deliveryType: 'standard', minDistanceKm: 4, maxDistanceKm: null },
+  ]
+
+  assert.throws(
+    () => calculateCharges(20, 'standard', gapRules, 3.5),
+    DeliveryRuleConfigurationError,
+  )
+})
+
+test('overlapping distance tiers are rejected as a configuration error', () => {
+  const overlapRules: ChargeRuleInput[] = [
+    { kind: 'DELIVERY', label: 'First', mode: 'FIXED', amount: 2, percentBase: null, deliveryType: 'standard', minDistanceKm: 0, maxDistanceKm: 4 },
+    { kind: 'DELIVERY', label: 'Second', mode: 'FIXED', amount: 5, percentBase: null, deliveryType: 'standard', minDistanceKm: 3, maxDistanceKm: null },
+  ]
+
+  assert.throws(
+    () => calculateCharges(20, 'standard', overlapRules, 3.5),
+    DeliveryRuleConfigurationError,
+  )
 })

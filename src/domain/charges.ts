@@ -1,4 +1,4 @@
-export type ChargeKind = 'DELIVERY' | 'SERVICE' | 'BFP'
+﻿export type ChargeKind = 'DELIVERY' | 'SERVICE' | 'BFP'
 export type AmountMode = 'FIXED' | 'PERCENT'
 export type PercentBase =
   | 'PRODUCT_SUBTOTAL'
@@ -38,6 +38,13 @@ export interface ChargeBreakdown {
   total: number
   deliveryZoneLabel?: string | null
   lines: AppliedCharge[]
+}
+
+export class DeliveryRuleConfigurationError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'DeliveryRuleConfigurationError'
+  }
 }
 
 const ALLOWED_BASES: Record<ChargeKind, PercentBase[]> = {
@@ -108,18 +115,32 @@ function hasDistanceBounds(rule: ChargeRuleInput) {
   return rule.minDistanceKm != null || rule.maxDistanceKm != null
 }
 
-function selectDeliveryRules(rules: ChargeRuleInput[], distanceKm?: number | null) {
-  const activeDelivery = rules.filter((item) => item.kind === 'DELIVERY' && item.active !== false)
+function selectDeliveryRules(
+  rules: ChargeRuleInput[],
+  deliveryType: string,
+  distanceKm?: number | null,
+) {
+  const activeDelivery = rules.filter(
+    (item) => item.kind === 'DELIVERY' && item.active !== false,
+  )
+
+  // A delivery-type-specific rule takes priority over a universal rule.
+  const specific = activeDelivery.filter((rule) => rule.deliveryType === deliveryType)
+  const universal = activeDelivery.filter((rule) => !rule.deliveryType)
+  const scopedRules = specific.length > 0 ? specific : universal
+
   if (distanceKm == null || !Number.isFinite(distanceKm)) {
-    // Without a known distance, prefer non-tiered rules or the lowest distance tier
-    const flat = activeDelivery.filter((rule) => !hasDistanceBounds(rule))
+    const flat = scopedRules.filter((rule) => !hasDistanceBounds(rule))
     if (flat.length > 0) return flat
-    const sorted = [...activeDelivery].sort((a, b) => (a.minDistanceKm ?? 0) - (b.minDistanceKm ?? 0))
+
+    const sorted = [...scopedRules].sort(
+      (a, b) => (a.minDistanceKm ?? 0) - (b.minDistanceKm ?? 0),
+    )
     return sorted.length ? [sorted[0]] : []
   }
 
-  const tiered = activeDelivery.filter(hasDistanceBounds)
-  if (tiered.length === 0) return activeDelivery
+  const tiered = scopedRules.filter(hasDistanceBounds)
+  if (tiered.length === 0) return scopedRules
 
   const safeDistance = Math.max(0, distanceKm)
   const matched = tiered.filter((rule) => {
@@ -128,15 +149,17 @@ function selectDeliveryRules(rules: ChargeRuleInput[], distanceKm?: number | nul
     return minOk && maxOk
   })
 
-  if (matched.length > 0) {
-    // Pick the most specific matching tier (highest minDistanceKm)
-    matched.sort((a, b) => (b.minDistanceKm ?? 0) - (a.minDistanceKm ?? 0))
-    return [matched[0]]
+  if (matched.length > 1) {
+    throw new DeliveryRuleConfigurationError(
+      `Overlapping ${deliveryType} delivery tiers match ${safeDistance} km. Please correct the delivery rules.`,
+    )
   }
 
-  // If distance exceeds all configured maxDistanceKm tiers, use the farthest tier
-  const farthest = [...tiered].sort((a, b) => (b.maxDistanceKm ?? Number.POSITIVE_INFINITY) - (a.maxDistanceKm ?? Number.POSITIVE_INFINITY))[0]
-  return farthest ? [farthest] : activeDelivery
+  if (matched.length === 1) return matched
+
+  throw new DeliveryRuleConfigurationError(
+    `No ${deliveryType} delivery charge is configured for ${safeDistance} km. Please contact the pharmacy.`,
+  )
 }
 
 function applyKind(
@@ -146,16 +169,19 @@ function applyKind(
   delivery: number,
   service: number,
   distanceKm?: number | null,
+  deliveryType = '',
 ) {
   const lines: AppliedCharge[] = []
   const selected =
     kind === 'DELIVERY'
-      ? selectDeliveryRules(rules, distanceKm)
+      ? selectDeliveryRules(rules, deliveryType, distanceKm)
       : rules.filter((item) => item.kind === kind && item.active !== false)
 
   for (const rule of selected) {
     assertChargeRule(rule)
-    const perKm = kind === 'DELIVERY' && rule.perKmRate != null && rule.perKmRate > 0 ? rule.perKmRate : 0
+    const perKm = kind === 'DELIVERY' && rule.perKmRate != null && rule.perKmRate > 0
+      ? rule.perKmRate
+      : 0
     const extraKm =
       perKm > 0 && distanceKm != null && Number.isFinite(distanceKm)
         ? Math.max(0, distanceKm - (rule.minDistanceKm ?? 0))
@@ -175,6 +201,7 @@ function applyKind(
       })
       continue
     }
+
     const base = baseAmount(rule.percentBase!, productSubtotal, delivery, service)
     const amount = roundMoney((base * rule.amount) / 100 + distanceSurcharge)
     lines.push({
@@ -187,23 +214,31 @@ function applyKind(
       amount,
     })
   }
+
   const total = roundMoney(lines.reduce((sum, line) => sum + line.amount, 0))
   return { lines, total }
 }
 
-/** Product prices stay on each line. Delivery, service, and BFP are applied in that order
- * so a percent can name an earlier charge as its base. The returned lines are what an order stores. */
+/** Product prices stay on each line. Delivery, service, and BFP are applied in that order. */
 export function calculateCharges(
   productSubtotal: number,
   deliveryType: string,
   rules: ChargeRuleInput[],
   distanceKm?: number | null,
 ): ChargeBreakdown {
-  const applicable = rules.filter((rule) => !rule.deliveryType || rule.deliveryType === deliveryType)
-  const delivery = applyKind('DELIVERY', applicable, productSubtotal, 0, 0, distanceKm)
-  const service = applyKind('SERVICE', applicable, productSubtotal, delivery.total, 0)
-  const bfp = applyKind('BFP', applicable, productSubtotal, delivery.total, service.total)
+  const delivery = applyKind(
+    'DELIVERY',
+    rules,
+    productSubtotal,
+    0,
+    0,
+    distanceKm,
+    deliveryType,
+  )
+  const service = applyKind('SERVICE', rules, productSubtotal, delivery.total, 0)
+  const bfp = applyKind('BFP', rules, productSubtotal, delivery.total, service.total)
   const lines = [...delivery.lines, ...service.lines, ...bfp.lines]
+
   return {
     productSubtotal: roundMoney(productSubtotal),
     deliveryCharge: delivery.total,
