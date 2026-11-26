@@ -18,12 +18,19 @@ import { reportRouter } from './routes/reports.js'
 import { riderRouter } from './routes/rider.js'
 import { teamRouter } from './routes/team.js'
 import { stockRouter } from './routes/stock.js'
+import { purchasingRouter } from './routes/purchasing.js'
 export function createApp() {
   const app = express()
   app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }))
   app.use(cors({ origin: true }))
   app.use(express.json({ limit: '1mb' }))
-  app.use('/uploads', express.static(path.resolve('uploads')))
+  // Prescription photos are private: browsers and shared caches must not keep them.
+  app.use('/uploads/prescriptions', (_req, res, next) => {
+    res.setHeader('Cache-Control', 'private, no-store')
+    res.setHeader('X-Robots-Tag', 'noindex')
+    next()
+  })
+  app.use('/uploads', express.static(path.resolve('uploads'), { index: false, dotfiles: 'deny' }))
   app.get('/health', (_req, res) => {
     res.json({ ok: true })
   })
@@ -40,6 +47,7 @@ export function createApp() {
   app.use('/admin/products/import', importRouter)
   app.use('/admin/reports', reportRouter)
   app.use('/admin/stock', stockRouter)
+  app.use('/admin/purchasing', purchasingRouter)
   app.use('/admin', teamRouter)
   app.use('/admin', adminRouter)
   app.use(errorHandler)

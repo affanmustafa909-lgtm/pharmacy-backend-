@@ -6,11 +6,12 @@ import multer from 'multer'
 import { z } from 'zod'
 import type { ChargeKind, PercentBase, Prisma } from '@prisma/client'
 import { assertChargeRule } from '../domain/charges.js'
-import { isExpired } from '../lib/expiry.js'
+import { isExpired, isValidExpiry, normalizeExpiry } from '../lib/expiry.js'
 import { HttpError, pageParams } from '../lib/http.js'
 import { prisma } from '../lib/prisma.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
 import { dec, money } from '../services/money.js'
+import { normalizeMobileConfig } from '../services/mobileConfig.js'
 import { notifyCustomer } from '../services/notifications.js'
 import { assertStatusTransition } from '../services/orderStatus.js'
 import {
@@ -94,6 +95,19 @@ function rejectExpiredBatch(name: string, expiry?: string | null) {
       'EXPIRED',
     )
   }
+}
+
+/**
+ * Checks that an expiry the admin typed can be read, and returns it as YYYY-MM-DD.
+ * An unreadable value (e.g. "abc" or "13/99") is refused, because it would never count as expired.
+ */
+function cleanExpiry(name: string, expiry?: string | null): string | undefined {
+  const raw = String(expiry ?? '').trim()
+  if (!raw) return undefined
+  if (!isValidExpiry(raw)) {
+    throw new HttpError(400, `${name || 'This medicine'} has an invalid expiry date "${raw}". Use YYYY-MM-DD or MM/YY.`, 'INVALID_EXPIRY')
+  }
+  return normalizeExpiry(raw) ?? raw
 }
 
 function zodFail(error: unknown) {
@@ -248,7 +262,13 @@ adminRouter.post('/products', async (req, res, next) => {
         imageUrl: body.imageUrl ?? '',
       },
     })
-
+    await writeAudit({
+      actorId: req.user!.id,
+      storeId: body.storeId,
+      action: 'product.create',
+      detail: `Added ${created.name} (${created.sku})`,
+      meta: { sku: created.sku, price: body.price, stock: body.stock },
+    })
     res.status(201).json({ id: created.id })
   } catch (error) {
     next(zodFail(error))
@@ -266,15 +286,34 @@ adminRouter.patch('/products/:id', async (req, res, next) => {
     await assertStoreAccess(req.user!, existing.storeId)
 
     const patch = productInput.partial().parse(req.body)
+    if (patch.storeId) await assertStoreAccess(req.user!, patch.storeId)
+    const priceChanged = patch.price != null && patch.price !== money(existing.price)
+    const stockChanged = patch.stock != null && patch.stock !== existing.stock
+    // Price needs the price permission. Stock edits need an owner or a store manager.
+    if (priceChanged) await assertStoreAccess(req.user!, existing.storeId, { requirePrice: true })
+    if (stockChanged) await assertStoreAccess(req.user!, existing.storeId, { roles: ['OWNER', 'STORE_MANAGER'] })
+    // Only the expiry text is checked here. An already-expired medicine can still be edited
+    // (price, stock, hold) and an admin may record a past date; the shop simply cannot sell it.
+    const patchExpiry = patch.expiry != null ? cleanExpiry(patch.name || existing.name, patch.expiry) : undefined
 
-    if (patch.storeId) {
-      await assertStoreAccess(req.user!, patch.storeId)
+    type Plain = string | number | boolean | null
+    const changes: Record<string, { from: Plain; to: Plain }> = {}
+    const track = (field: string, from: Plain, to: Plain | undefined) => {
+      if (to !== undefined && from !== to) changes[field] = { from, to }
     }
-
-    rejectExpiredBatch(
-      patch.name || existing.name,
-      patch.expiry ?? existing.expiry,
-    )
+    track('name', existing.name, patch.name)
+    track('brand', existing.brand, patch.brand)
+    track('category', existing.category, patch.category)
+    track('unitLabel', existing.unitLabel, patch.unitLabel)
+    track('sku', existing.sku, patch.sku)
+    track('batch', existing.batch, patch.batch)
+    track('expiry', existing.expiry, patchExpiry)
+    track('rxRequired', existing.rxRequired, patch.rxRequired)
+    track('onlineSale', existing.onlineSale, patch.onlineSale)
+    track('held', existing.held, patch.held)
+    track('lowStockAlerts', existing.lowStockAlerts, patch.lowStockAlerts)
+    track('storeId', existing.storeId, patch.storeId)
+    const oldPrice = money(existing.price)
 
     await prisma.product.update({
       where: { id: existing.id },
@@ -287,12 +326,12 @@ adminRouter.patch('/products/:id', async (req, res, next) => {
         ...(patch.category != null ? { category: patch.category } : {}),
         ...(patch.price != null ? { price: dec(patch.price) } : {}),
         ...(patch.unitLabel != null ? { unitLabel: patch.unitLabel } : {}),
-        ...(patch.stock != null ? { stock: patch.stock } : {}),
+        // stock is not written here. A stock edit goes through the stock history below.
         ...(patch.rxRequired != null ? { rxRequired: patch.rxRequired } : {}),
         ...(patch.sku != null ? { sku: patch.sku } : {}),
         ...(patch.description != null ? { description: patch.description } : {}),
         ...(patch.batch != null ? { batch: patch.batch } : {}),
-        ...(patch.expiry != null ? { expiry: patch.expiry } : {}),
+        ...(patchExpiry ? { expiry: patchExpiry } : {}),
         ...(patch.onlineSale != null ? { onlineSale: patch.onlineSale } : {}),
         ...(patch.held != null ? { held: patch.held } : {}),
         ...(patch.published != null ? { published: patch.published } : {}),
@@ -302,7 +341,41 @@ adminRouter.patch('/products/:id', async (req, res, next) => {
         ...(patch.imageUrl != null ? { imageUrl: patch.imageUrl } : {}),
       },
     })
-
+    if (stockChanged && patch.stock != null) {
+      await recordStockMovement({
+        productId: existing.id,
+        storeId: existing.storeId,
+        quantity: patch.stock - existing.stock,
+        reason: 'manual_adjustment',
+        note: `Stock edited in the product form (${existing.stock} to ${patch.stock})`,
+        userId: req.user!.id,
+      })
+      await writeAudit({
+        actorId: req.user!.id,
+        storeId: existing.storeId,
+        action: 'stock.edit',
+        detail: `${existing.name}: stock ${existing.stock} → ${patch.stock}`,
+        meta: { sku: existing.sku, from: existing.stock, to: patch.stock },
+      })
+    }
+    if (priceChanged && patch.price != null) {
+      await writeAudit({
+        actorId: req.user!.id,
+        storeId: existing.storeId,
+        action: 'product.price',
+        detail: `${existing.name}: price ${oldPrice} → ${patch.price}`,
+        meta: { sku: existing.sku, from: oldPrice, to: patch.price },
+      })
+    }
+    if (Object.keys(changes).length > 0) {
+      await writeAudit({
+        actorId: req.user!.id,
+        storeId: existing.storeId,
+        action: 'product.update',
+        detail: `${existing.name}: changed ${Object.keys(changes).join(', ')}`,
+        meta: { sku: existing.sku, changes },
+      })
+    }
     res.status(204).end()
   } catch (error) {
     next(zodFail(error))
@@ -323,7 +396,13 @@ adminRouter.post('/products/:id/deactivate', async (req, res, next) => {
       where: { id: existing.id },
       data: { held: true, onlineSale: false },
     })
-
+    await writeAudit({
+      actorId: req.user!.id,
+      storeId: existing.storeId,
+      action: 'product.hold',
+      detail: `${existing.name} was deactivated`,
+      meta: { sku: existing.sku },
+    })
     res.status(204).end()
   } catch (error) {
     next(error)
@@ -339,7 +418,13 @@ adminRouter.delete('/products/:id', async (req, res, next) => {
     if (!existing) throw new HttpError(404, 'Medicine not found')
 
     await assertStoreAccess(req.user!, existing.storeId)
-
+    await writeAudit({
+      actorId: req.user!.id,
+      storeId: existing.storeId,
+      action: 'product.delete',
+      detail: `${existing.name} (${existing.sku}) was deleted`,
+      meta: { sku: existing.sku, price: money(existing.price), stock: existing.stock },
+    })
     await prisma.product.delete({ where: { id: existing.id } })
 
     res.status(204).end()
@@ -1122,7 +1207,15 @@ adminRouter.post('/orders/:number/status', async (req, res, next) => {
         })
       }
     }
-
+    if (body.status === 'cancelled' && order.status !== 'cancelled') {
+      await writeAudit({
+        actorId: req.user!.id,
+        storeId: order.storeId,
+        action: 'order.cancel',
+        detail: `${order.number} cancelled`,
+        meta: { from: order.status, reason: body.cancelReason ?? '' },
+      })
+    }
     if (body.refundAmount && body.refundAmount > 0) {
       await writeAudit({
         actorId: req.user!.id,
@@ -1202,6 +1295,9 @@ adminRouter.post('/prescriptions/:number/decision', async (req, res, next) => {
       throw new HttpError(403, 'Your role cannot review prescriptions')
     }
 
+    if ((body.status === 'rejected' || body.status === 'needs_clearer_photo') && !body.notes?.trim()) {
+      throw new HttpError(400, 'Add a short reason so the patient knows what to do next')
+    }
     if (
       prescription.status === 'rejected' ||
       prescription.status === 'dispensed'
@@ -1671,6 +1767,8 @@ adminRouter.patch('/pharmacies/:id', async (req, res, next) => {
       meta: {
         status: body.status ?? null,
         acceptingOrders: body.acceptingOrders ?? null,
+        pharmacistUserId: body.pharmacistUserId ?? null,
+        managerUserId: body.managerUserId ?? null,
       },
     })
 
@@ -1768,6 +1866,269 @@ adminRouter.patch('/customers/:id', async (req, res, next) => {
       gender: updated.gender,
       allergies: updated.allergies,
     })
+  } catch (error) {
+    next(zodFail(error))
+  }
+})
+
+adminRouter.get('/audit-log', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'ADMIN') throw new HttpError(403, 'Audit log is owner-only')
+    const storeId = String(req.query.storeId ?? '')
+    if (storeId) await assertStoreAccess(req.user!, storeId)
+    // Optional filters: ?action=product (matches product.price, product.update ...), ?from=, ?to=, ?limit=
+    const action = String(req.query.action ?? '').trim()
+    const from = req.query.from ? new Date(String(req.query.from)) : undefined
+    const to = req.query.to ? new Date(String(req.query.to)) : undefined
+    if ((from && Number.isNaN(from.getTime())) || (to && Number.isNaN(to.getTime()))) {
+      throw new HttpError(400, 'Date is not valid')
+    }
+    const limit = Math.min(Math.max(Number(req.query.limit) || 200, 1), 500)
+    const allowed = await accessibleStoreIds(req.user!)
+    const items = await prisma.auditLog.findMany({
+      where: {
+        ...(storeId ? { storeId } : allowed ? { storeId: { in: allowed } } : {}),
+        ...(action ? { action: { startsWith: action } } : {}),
+        ...(from || to ? { createdAt: { gte: from, lte: to } } : {}),
+      },
+      include: { actor: true, store: true },
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+    })
+    res.json({
+      items: items.map((item) => ({
+        id: item.id,
+        action: item.action,
+        detail: item.detail,
+        actor: item.actor?.name ?? 'System',
+        storeCode: item.store?.code ?? '',
+        storeName: item.store?.name ?? '',
+        createdAt: item.createdAt.toISOString(),
+        meta: item.meta,
+      })),
+    })
+  } catch (error) {
+    next(error)
+  }
+})
+
+adminRouter.post('/reminders/:id/toggle', async (req, res, next) => {
+  try {
+    const reminder = await prisma.reminder.findUnique({ where: { id: req.params.id } })
+    if (!reminder) throw new HttpError(404, 'Reminder not found')
+    await prisma.reminder.update({ where: { id: reminder.id }, data: { enabled: !reminder.enabled } })
+    res.status(204).end()
+  } catch (error) {
+    next(error)
+  }
+})
+
+adminRouter.post('/reminders', async (req, res, next) => {
+  try {
+    const body = z
+      .object({
+        customerName: z.string().trim().min(1).max(80),
+        medicine: z.string().trim().min(1).max(120),
+        time: z.string().trim().min(1).max(40),
+        frequency: z.string().trim().min(1).max(40),
+        enabled: z.boolean().optional(),
+      })
+      .parse(req.body)
+    const customer = await prisma.user.findFirst({
+      where: { role: 'CUSTOMER', name: { equals: body.customerName, mode: 'insensitive' } },
+    })
+    await prisma.reminder.create({
+      data: {
+        customerId: customer?.id,
+        customerName: body.customerName,
+        medicine: body.medicine,
+        time: body.time,
+        frequency: body.frequency,
+        enabled: body.enabled ?? true,
+      },
+    })
+    res.status(201).json({ ok: true })
+  } catch (error) {
+    next(zodFail(error))
+  }
+})
+
+adminRouter.delete('/reminders/:id', async (req, res, next) => {
+  try {
+    const reminder = await prisma.reminder.findUnique({ where: { id: req.params.id } })
+    if (!reminder) throw new HttpError(404, 'Reminder not found')
+    await prisma.reminder.delete({ where: { id: reminder.id } })
+    res.status(204).end()
+  } catch (error) {
+    next(error)
+  }
+})
+
+adminRouter.get('/mobile-config', async (_req, res) => {
+  const setting = await prisma.setting.findUnique({ where: { id: 'default' } })
+  const promos = await prisma.promoCode.findMany({ orderBy: { code: 'asc' } })
+  res.json({
+    config: normalizeMobileConfig(setting?.mobileConfig),
+    promos: promos.map((promo) => ({
+      id: promo.id,
+      code: promo.code,
+      label: promo.label,
+      discount: money(promo.discount),
+      active: promo.active,
+    })),
+  })
+})
+
+adminRouter.put('/mobile-config', async (req, res, next) => {
+  try {
+    const config = normalizeMobileConfig(req.body?.config ?? req.body)
+    await prisma.setting.update({
+      where: { id: 'default' },
+      data: { mobileConfig: config },
+    })
+    res.status(204).end()
+  } catch (error) {
+    next(error)
+  }
+})
+
+adminRouter.post('/promos', async (req, res, next) => {
+  try {
+    const body = z
+      .object({
+        code: z.string().trim().min(2).max(40),
+        label: z.string().trim().min(1).max(120),
+        discount: z.number().min(0),
+        active: z.boolean().optional(),
+      })
+      .parse(req.body)
+    await prisma.promoCode.create({
+      data: {
+        code: body.code.toUpperCase(),
+        label: body.label,
+        discount: dec(body.discount),
+        active: body.active ?? true,
+      },
+    })
+    res.status(201).json({ ok: true })
+  } catch (error) {
+    next(zodFail(error))
+  }
+})
+
+adminRouter.patch('/promos/:id', async (req, res, next) => {
+  try {
+    const body = z
+      .object({
+        label: z.string().trim().min(1).max(120).optional(),
+        discount: z.number().min(0).optional(),
+        active: z.boolean().optional(),
+      })
+      .parse(req.body)
+    const promo = await prisma.promoCode.findUnique({ where: { id: req.params.id } })
+    if (!promo) throw new HttpError(404, 'Promo not found')
+    await prisma.promoCode.update({
+      where: { id: promo.id },
+      data: {
+        ...(body.label != null ? { label: body.label } : {}),
+        ...(body.discount != null ? { discount: dec(body.discount) } : {}),
+        ...(body.active != null ? { active: body.active } : {}),
+      },
+    })
+    res.status(204).end()
+  } catch (error) {
+    next(zodFail(error))
+  }
+})
+
+adminRouter.delete('/promos/:id', async (req, res, next) => {
+  try {
+    const promo = await prisma.promoCode.findUnique({ where: { id: req.params.id } })
+    if (!promo) throw new HttpError(404, 'Promo not found')
+    await prisma.promoCode.delete({ where: { id: promo.id } })
+    res.status(204).end()
+  } catch (error) {
+    next(error)
+  }
+})
+
+adminRouter.post('/campaigns/:id/toggle', async (req, res, next) => {
+  try {
+    const campaign = await prisma.campaign.findUnique({ where: { id: req.params.id } })
+    if (!campaign) throw new HttpError(404, 'Campaign not found')
+    await prisma.campaign.update({ where: { id: campaign.id }, data: { active: !campaign.active } })
+    res.status(204).end()
+  } catch (error) {
+    next(error)
+  }
+})
+
+adminRouter.post('/care/redeem', async (req, res, next) => {
+  try {
+    const points = z.object({ points: z.number().int().positive() }).parse(req.body).points
+    const setting = await prisma.setting.findUnique({ where: { id: 'default' } })
+    if (!setting || points > setting.carePoints) throw new HttpError(400, 'Not enough care points')
+    await prisma.setting.update({
+      where: { id: 'default' },
+      data: { carePoints: { decrement: points }, rewardValue: Math.max(0, setting.rewardValue - 25) },
+    })
+    await prisma.careEvent.create({ data: { title: 'Redeemed · refill reminder batch', dateLabel: 'Today', points: -points } })
+    res.status(204).end()
+  } catch (error) {
+    next(zodFail(error))
+  }
+})
+
+adminRouter.post('/messages/:threadId', async (req, res, next) => {
+  try {
+    const text = z.object({ text: z.string().trim().min(1).max(1000) }).parse(req.body).text
+    const thread = await prisma.messageThread.findUnique({ where: { id: req.params.threadId } })
+    if (!thread) throw new HttpError(404, 'Conversation not found')
+    await prisma.message.create({
+      data: {
+        threadId: thread.id,
+        from: 'staff',
+        text,
+        at: new Date().toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }),
+      },
+    })
+    await prisma.messageThread.update({ where: { id: thread.id }, data: { unread: 0 } })
+    res.status(204).end()
+  } catch (error) {
+    next(zodFail(error))
+  }
+})
+
+adminRouter.post('/notices/read', async (_req, res) => {
+  await prisma.notice.updateMany({ data: { read: true } })
+  res.status(204).end()
+})
+
+adminRouter.post('/settings', async (req, res, next) => {
+  try {
+    const patch = z.object({
+      storeName: z.string().trim().min(1).max(80).optional(),
+      alertEmail: z.boolean().optional(),
+      lowStockThreshold: z.number().int().min(0).optional(),
+      autoApproveRefills: z.boolean().optional(),
+      showOutOfStock: z.boolean().optional(),
+    }).parse(req.body)
+    await prisma.setting.update({ where: { id: 'default' }, data: patch })
+    res.status(204).end()
+  } catch (error) {
+    next(zodFail(error))
+  }
+})
+
+adminRouter.post('/payouts', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'ADMIN') throw new HttpError(403, 'Only a pharmacy lead can record a payout')
+    const body = z.object({ amount: z.number().positive(), note: z.string().max(160).optional() }).parse(req.body)
+    await prisma.payout.create({ data: { amount: dec(body.amount), note: body.note?.trim() || 'Manual payout' } })
+    await prisma.notice.create({
+      data: { title: 'Payout recorded', body: body.note?.trim() || `$${body.amount.toFixed(2)} marked for settlement.`, at: 'Just now', page: 'reports' },
+    })
+    res.status(204).end()
   } catch (error) {
     next(zodFail(error))
   }

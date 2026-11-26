@@ -1,8 +1,9 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { Router } from 'express'
 import fs from 'node:fs'
 import path from 'node:path'
 import multer from 'multer'
+import { Prisma } from '@prisma/client'
 import { z } from 'zod'
 import { HttpError } from '../lib/http.js'
 import { prisma } from '../lib/prisma.js'
@@ -23,7 +24,8 @@ const upload = multer({
     destination: (_req, _file, cb) => cb(null, uploadDir),
     filename: (_req, file, cb) => {
       const ext = path.extname(file.originalname).toLowerCase() || '.jpg'
-      cb(null, `rx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`)
+      // A long random name: the photo link cannot be guessed, because these are patients' prescriptions.
+      cb(null, `rx-${randomBytes(16).toString('hex')}${ext}`)
     },
   }),
   limits: { fileSize: 5 * 1024 * 1024 },
@@ -45,6 +47,12 @@ const detectedSchema = z.object({
 function hashFile(filePath: string) {
   const bytes = fs.readFileSync(filePath)
   return createHash('sha256').update(bytes).digest('hex')
+}
+
+/** If the request fails after the photo was saved, remove the photo so no orphan file stays on disk. */
+function discardUpload(file?: { filename: string }) {
+  if (!file) return
+  fs.unlink(path.join(uploadDir, file.filename), () => undefined)
 }
 
 function assessReadable(scannedText: string, fileSize: number) {
@@ -262,12 +270,12 @@ prescriptionRouter.post('/', (req, res, next) => {
       }
 
       const filePath = path.join(uploadDir, req.file.filename)
-      const imageHash = body.imageHash?.trim() || hashFile(filePath)
+      // The hash always comes from the real saved file. A hash sent by the app is not trusted.
+      const imageHash = hashFile(filePath)
+      // OCR text is only kept when it is submitted with this upload (same request)
       const scannedText = body.scannedText?.trim() || ''
       const detected = parseDetected(body.detectedDetails)
       const readable = assessReadable(scannedText, req.file.size) && !detected.unclear
-      const count = await prisma.prescription.count()
-      const number = `PX-${2200 + count + 1}`
       const medicineName =
         body.medicineName?.trim() ||
         detected.name?.trim() ||
@@ -281,31 +289,44 @@ prescriptionRouter.post('/', (req, res, next) => {
         if (!product) linkedProductId = null
       }
 
-      const created = await prisma.prescription.create({
-        data: {
-          number,
-          customerId: req.user!.id,
-          customerName: req.user!.name,
-          storeId: body.storeId,
-          uploadType: body.uploadType,
-          medicineName,
-          prescriber: body.prescriber?.trim() || '',
-          quantity: body.quantity?.trim() || detected.packSize || '',
-          imageUrl: `/uploads/prescriptions/${req.file.filename}`,
-          imageHash,
-          scannedText,
-          imageReadable: readable,
-          detectedDetails: detected,
-          linkedProductId,
-          customerNote: body.customerNote?.trim() || '',
-          status: readable ? 'pending' : 'needs_clearer_photo',
-          notes: readable
-            ? ''
-            : 'Photo looks unreadable. Please replace with a clearer image.',
-          verifiedItems: [],
-        },
-        include: { store: true },
-      })
+      // Two uploads at the same moment could pick the same number. If that happens, try the next one.
+      let created: Prisma.PrescriptionGetPayload<{ include: { store: true } }> | null = null
+      for (let attempt = 0; attempt < 5 && !created; attempt += 1) {
+        const count = await prisma.prescription.count()
+        const number = `PX-${2200 + count + 1 + attempt}`
+        try {
+          created = await prisma.prescription.create({
+            data: {
+              number,
+              customerId: req.user!.id,
+              customerName: req.user!.name,
+              storeId: body.storeId,
+              uploadType: body.uploadType,
+              medicineName,
+              prescriber: body.prescriber?.trim() || '',
+              quantity: body.quantity?.trim() || detected.packSize || '',
+              imageUrl: `/uploads/prescriptions/${req.file.filename}`,
+              imageHash,
+              scannedText,
+              imageReadable: readable,
+              detectedDetails: detected,
+              linkedProductId,
+              customerNote: body.customerNote?.trim() || '',
+              status: readable ? 'pending' : 'needs_clearer_photo',
+              notes: readable
+                ? ''
+                : 'Photo looks unreadable. Please replace with a clearer image.',
+              verifiedItems: [],
+            },
+            include: { store: true },
+          })
+        } catch (error) {
+          const numberTaken =
+            error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002'
+          if (!numberTaken) throw error
+        }
+      }
+      if (!created) throw new HttpError(503, 'Could not save the prescription. Please try again.')
 
       const kindLabel = body.uploadType === 'medicine_packaging' ? 'Photo request' : 'Prescription'
       await prisma.notice.create({
@@ -327,6 +348,7 @@ prescriptionRouter.post('/', (req, res, next) => {
       })
       res.status(201).json({ prescription: mapPrescription(created) })
     } catch (error) {
+      discardUpload(req.file)
       next(error instanceof z.ZodError ? new HttpError(400, 'Check the photo request details') : error)
     }
   })
@@ -349,7 +371,9 @@ prescriptionRouter.post('/:number/replace-image', (req, res, next) => {
         throw new HttpError(400, 'Photo is too small or unclear. Retake with better lighting.')
       }
       const filePath = path.join(uploadDir, req.file.filename)
-      const imageHash = String(req.body.imageHash ?? '').trim() || hashFile(filePath)
+      // Always hash the saved file; never trust a client-supplied hash.
+      // Always replace OCR with text from this same upload request — never keep stale OCR from a prior photo.
+      const imageHash = hashFile(filePath)
       const scannedText = String(req.body.scannedText ?? '').trim()
       const detected = parseDetected(req.body.detectedDetails)
       const readable = assessReadable(scannedText, req.file.size) && !detected.unclear
@@ -389,6 +413,7 @@ prescriptionRouter.post('/:number/replace-image', (req, res, next) => {
       })
       res.json({ prescription: mapPrescription(updated) })
     } catch (error) {
+      discardUpload(req.file)
       next(error)
     }
   })

@@ -385,6 +385,46 @@ authRouter.post('/change-password', requireAuth, async (req, res, next) => {
   }
 })
 
+// Allows changing email and/or password with the current password (kainat + main compatibility).
+authRouter.post('/change-credentials', requireAuth, async (req, res, next) => {
+  try {
+    const body = z
+      .object({
+        currentPassword: z.string().min(8),
+        newEmail: z.string().email().optional(),
+        newPassword: z.string().min(8).max(100).optional(),
+      })
+      .parse(req.body)
+    if (!body.newEmail && !body.newPassword) throw new HttpError(400, 'Enter a new email or a new password')
+
+    const user = await prisma.user.findUnique({ where: { id: req.user!.id } })
+    if (!user) throw new HttpError(401, 'Sign in required')
+    if (!(await checkPassword(body.currentPassword, user.passwordHash))) {
+      throw new HttpError(400, 'Current password is incorrect')
+    }
+
+    const data: { email?: string; passwordHash?: string; passwordResetToken?: null; passwordResetExpires?: null } = {}
+    if (body.newEmail) {
+      const email = body.newEmail.toLowerCase()
+      if (email !== user.email) {
+        const taken = await prisma.user.findUnique({ where: { email } })
+        if (taken) throw new HttpError(409, 'This email is already used by another account')
+        data.email = email
+      }
+    }
+    if (body.newPassword) {
+      data.passwordHash = await hashPassword(body.newPassword)
+      data.passwordResetToken = null
+      data.passwordResetExpires = null
+    }
+    if (Object.keys(data).length > 0) await prisma.user.update({ where: { id: user.id }, data })
+
+    res.json({ ok: true })
+  } catch (error) {
+    next(error instanceof z.ZodError ? new HttpError(400, 'Enter a valid email and a password of at least 8 characters') : error)
+  }
+})
+
 authRouter.post('/login', async (req, res, next) => {
   try {
     const body = z.object({ email: z.string().email(), password: z.string().min(6) }).parse(req.body)

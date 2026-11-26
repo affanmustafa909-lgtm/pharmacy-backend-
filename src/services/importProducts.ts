@@ -155,17 +155,33 @@ function truthy(value: string) {
   return ['1', 'true', 'yes', 'y'].includes(value.trim().toLowerCase())
 }
 
+/** Price must be a real number. "abc" or empty => NaN (row fails). Allows "1,200.50" and "Rs. 12". */
 function parsePrice(value: string) {
-  const cleaned = value.replace(/[^0-9.-]/g, '')
-  const price = Number(cleaned)
-  return price
+  const text = value.trim().replace(/,/g, '').replace(/^(rs\.?|pkr|\$)\s*/i, '')
+  if (!/^\d+(\.\d+)?$/.test(text)) return Number.NaN
+  return Number(text)
 }
 
+/** Stock must be a whole number >= 0. Empty = 0. "abc", "10.5", "-3" => NaN (row fails). */
 function parseStock(value: string) {
-  if (!value.trim()) return 0
-  const stock = Number(value.replace(/[^0-9.-]/g, ''))
-  if (!Number.isFinite(stock) || stock < 0) return Number.NaN
-  return Math.round(stock)
+  const text = value.trim().replace(/,/g, '')
+  if (!text) return 0
+  if (!/^\d+$/.test(text)) return Number.NaN
+  const stock = Number(text)
+  return stock > 1_000_000 ? Number.NaN : stock
+}
+
+/** Empty is fine. Otherwise: an embedded picture path, or an http(s) link. */
+function isValidImage(url: string) {
+  if (!url) return true
+  if (url.startsWith('/uploads/products/')) return /\.(png|jpe?g|jfif|webp|gif)$/i.test(url)
+  if (url.length > 500) return false
+  try {
+    const parsed = new URL(url)
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:'
+  } catch {
+    return false
+  }
 }
 
 function slugSku(name: string, rowNumber: number) {
@@ -220,12 +236,14 @@ export async function previewRows(
     }
     if (!sku) errors.push('SKU is required')
     if (!name) errors.push('Name is required')
-    if (!Number.isFinite(price) || price < 0) errors.push('Price must be zero or more')
-    if (!Number.isFinite(stock)) errors.push('Stock must be a whole number')
+    if (!Number.isFinite(price) || price < 0) errors.push('Price must be a number (0 or more)')
+    if (!Number.isFinite(stock)) errors.push('Stock must be a whole number (0 or more)')
+    if (!isValidImage(imageUrl)) errors.push('Image must be a web link (http/https) or an embedded picture')
     const expiryRaw = read('expiry')
     const expiry = normalizeExpiry(expiryRaw) ?? ''
     if (expiryRaw && !isValidExpiry(expiryRaw)) errors.push(`Expiry date "${expiryRaw}" is not readable (use YYYY-MM-DD or MM/YY)`)
     else if (expiry && isExpired(expiry)) errors.push('Expiry date is in the past')
+    if (Number.isFinite(stock) && stock > 0 && !expiryRaw) errors.push('Expiry date is required when stock is above 0')
     let duplicate = false
     if (store && sku) {
       const key = `${store.id}:${sku.toLowerCase()}`
@@ -324,6 +342,30 @@ export async function templateBuffer() {
   sheet.getRow(1).font = { bold: true }
   sheet.columns.forEach((column) => {
     column.width = 18
+  })
+  const data = await workbook.xlsx.writeBuffer()
+  return Buffer.from(data)
+}
+
+/** Excel file of the rows that failed, with the reason in the "Errors" column. */
+export async function failedRowsBuffer(
+  failed: { rowNumber: number; errors: string[]; values?: Record<string, string> }[],
+) {
+  const workbook = new ExcelJS.Workbook()
+  const sheet = workbook.addWorksheet('Failed rows')
+  const columns: string[] = []
+  for (const item of failed) {
+    for (const key of Object.keys(item.values ?? {})) {
+      if (!columns.includes(key)) columns.push(key)
+    }
+  }
+  sheet.addRow(['Row', 'Errors', ...columns])
+  for (const item of failed) {
+    sheet.addRow([item.rowNumber, item.errors.join('; '), ...columns.map((column) => item.values?.[column] ?? '')])
+  }
+  sheet.getRow(1).font = { bold: true }
+  sheet.columns.forEach((column) => {
+    column.width = 20
   })
   const data = await workbook.xlsx.writeBuffer()
   return Buffer.from(data)
