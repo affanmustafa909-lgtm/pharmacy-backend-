@@ -19,6 +19,7 @@ import { riderRouter } from './routes/rider.js'
 import { teamRouter } from './routes/team.js'
 import { stockRouter } from './routes/stock.js'
 import { purchasingRouter } from './routes/purchasing.js'
+import { adminPaymentRouter, paymentRouter } from './routes/payments.js'
 export function createApp() {
   const app = express()
   app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }))
@@ -37,7 +38,9 @@ export function createApp() {
   app.use('/auth', authRouter)
   app.use('/catalog', catalogRouter)
   app.use('/orders', customerOrderRouter)
+  app.use('/payments', paymentRouter)
   app.use('/admin/orders', adminOrderRouter)
+  app.use('/admin/payments', adminPaymentRouter)
   app.use('/addresses', addressRouter)
   app.use('/favorites', favoritesRouter)
   app.use('/reminders', reminderRouter)

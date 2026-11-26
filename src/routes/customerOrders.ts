@@ -7,6 +7,7 @@ import { prisma } from '../lib/prisma.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
 import {
   assertDeliveryAddress,
+  checkoutAddressInputSchema,
   deliveryAddressSchema,
   pickupContactSchema,
 } from '../services/deliveryAddress.js'
@@ -22,6 +23,7 @@ import {
   recheckBuyAgain,
 } from '../services/orders.js'
 import { findNearbyStores } from '../services/nearbyStores.js'
+import { claimPaymentForCheckout } from '../services/payments.js'
 
 const itemsSchema = z
   .array(z.object({ productId: z.string().min(1), quantity: z.number().int().positive() }))
@@ -40,6 +42,7 @@ const quoteSchema = z.object({
 const placeSchema = quoteSchema.extend({
   paymentLabel: z.string().min(1).max(80),
   paymentStatus: z.enum(['paid', 'unpaid']).optional(),
+  paymentTransactionId: z.string().min(1).optional(),
   addressLine: z.string().max(240).default(''),
 })
 
@@ -47,13 +50,14 @@ const checkoutSchema = z.object({
   deliveryType: z.enum(['standard', 'express', 'pickup']),
   paymentLabel: z.string().min(1).max(80),
   paymentStatus: z.enum(['paid', 'unpaid']).optional(),
+  paymentTransactionId: z.string().min(1).optional(),
   items: itemsSchema,
   idempotencyKey: z.string().trim().min(8).max(120),
   confirmSplit: z.boolean().optional(),
   promoCode: z.string().trim().max(40).optional(),
   prescriptionNumber: z.string().trim().max(40).optional(),
   addressId: z.string().min(1).optional(),
-  address: deliveryAddressSchema.partial().optional(),
+  address: checkoutAddressInputSchema.optional(),
   pickupContact: pickupContactSchema.optional(),
   recipientName: z.string().trim().max(80).optional(),
   recipientPhone: z.string().trim().max(40).optional(),
@@ -97,20 +101,29 @@ customerOrderRouter.post('/nearby-stores', async (req, res, next) => {
   try {
     const body = z
       .object({
-        address: deliveryAddressSchema.partial().extend({
-          city: z.string().trim().min(1).optional(),
-          area: z.string().trim().min(1).optional(),
-          line: z.string().trim().min(1).optional(),
-        }),
+        addressId: z.string().min(1).optional(),
+        address: deliveryAddressSchema
+          .partial()
+          .extend({
+            city: z.string().trim().min(1).optional(),
+            area: z.string().trim().min(1).optional(),
+            line: z.string().trim().min(1).optional(),
+          })
+          .optional(),
         deliveryType: z.enum(['standard', 'express', 'pickup']).optional(),
         skus: z
           .array(z.object({ sku: z.string().min(1), quantity: z.number().int().positive() }))
           .max(40)
           .optional(),
       })
+      .refine((value) => Boolean(value.addressId || value.address), {
+        message: 'Provide a saved address or address details',
+      })
       .parse(req.body)
     const result = await findNearbyStores({
-      address: body.address,
+      address: body.address ?? {},
+      addressId: body.addressId,
+      customerId: req.user!.id,
       deliveryType: body.deliveryType,
       skus: body.skus,
     })
@@ -175,15 +188,21 @@ customerOrderRouter.post('/checkout', async (req, res, next) => {
       } else {
         cityGuess = cityGuess.replace(/\s+[A-Z]{2}$/i, '').trim() || cityGuess
       }
+      // Pad 1-character saved fields (e.g. area "d") so checkout is not blocked after card pay.
+      const pad = (value: unknown, fallback: string) => {
+        const text = String(value ?? '').trim()
+        if (!text) return fallback
+        return text.length >= 2 ? text : `${text}${fallback}`.slice(0, 80)
+      }
       const address = assertDeliveryAddress(
         deliveryAddressSchema.parse({
           label: textOr(raw.label, 'Home', 1),
           recipientName: textOr(raw.recipientName, textOr(body.recipientName, 'Customer')),
           phone: textOr(raw.phone, textOr(body.recipientPhone, '+10000000000', 8), 8),
           houseNo: textOr(raw.houseNo, 'N/A', 1),
-          street: textOr(raw.street, lineParts[0] || body.addressLine || 'Address'),
-          area: textOr(raw.area, 'Local area'),
-          city: textOr(raw.city, cityGuess),
+          street: pad(raw.street, lineParts[0] || body.addressLine || 'Address'),
+          area: pad(raw.area, 'Local area'),
+          city: pad(raw.city, cityGuess.length >= 2 ? cityGuess : 'City'),
           landmark: String(raw.landmark ?? '').trim(),
           deliveryInstructions: String(raw.deliveryInstructions ?? '').trim(),
           lat: typeof raw.lat === 'number' ? raw.lat : null,
@@ -204,6 +223,7 @@ customerOrderRouter.post('/checkout', async (req, res, next) => {
       deliveryType: body.deliveryType,
       paymentLabel: body.paymentLabel,
       paymentStatus: body.paymentStatus,
+      paymentTransactionId: body.paymentTransactionId,
       recipientName,
       recipientPhone,
       addressLine,
@@ -219,6 +239,9 @@ customerOrderRouter.post('/checkout', async (req, res, next) => {
       checkoutGroupId: result.checkoutGroupId,
       combinedTotal: result.combinedTotal,
       reused: result.reused,
+      transactionId: result.paymentTransaction?.transactionId ?? null,
+      paymentStatus: result.orders[0]?.paymentStatus ?? body.paymentStatus ?? 'paid',
+      paymentLabel: result.orders[0]?.paymentLabel ?? body.paymentLabel,
       orders: result.orders.map((order) => ({
         id: order.number,
         storeId: order.storeId,
@@ -231,6 +254,7 @@ customerOrderRouter.post('/checkout', async (req, res, next) => {
         discount: money(order.discount),
         paymentStatus: order.paymentStatus,
         paymentLabel: order.paymentLabel,
+        transactionId: result.paymentTransaction?.transactionId ?? null,
         itemCount: order.items.reduce((sum, item) => sum + item.quantity, 0),
         deliveryType: order.deliveryType,
         recipientName: order.recipientName,
@@ -242,7 +266,17 @@ customerOrderRouter.post('/checkout', async (req, res, next) => {
     })
   } catch (error) {
     if (error instanceof z.ZodError) {
-      next(new HttpError(400, error.issues[0]?.message || 'Check the order details'))
+      const issue = error.issues[0]
+      const field = issue?.path?.length ? String(issue.path[issue.path.length - 1]) : ''
+      const message = issue?.message || 'Check the order details'
+      next(
+        new HttpError(
+          400,
+          field && /at least 2 character/i.test(message)
+            ? `Complete the ${field} field (at least 2 characters)`
+            : message,
+        ),
+      )
       return
     }
     next(error)
@@ -252,17 +286,56 @@ customerOrderRouter.post('/checkout', async (req, res, next) => {
 customerOrderRouter.post('/', async (req, res, next) => {
   try {
     const body = placeSchema.parse(req.body)
+    let paymentLabel = body.paymentLabel
+    let paymentStatus = body.paymentStatus
+    let paymentTransactionId = body.paymentTransactionId
+    let transactionId: string | null = null
+
+    if (paymentTransactionId) {
+      const quoted = await quoteOrder({
+        ...body,
+        customerId: req.user!.id,
+        enforceRx: false,
+      })
+      const claimed = await claimPaymentForCheckout({
+        customerId: req.user!.id,
+        paymentTransactionId,
+        expectedAmount: quoted.charges.total,
+        paymentLabel,
+      })
+      paymentTransactionId = claimed.txn.id
+      paymentLabel = claimed.paymentLabel
+      paymentStatus = 'paid'
+      transactionId = claimed.txn.transactionId
+    }
+
     const order = await placeOrder({
       ...body,
+      paymentLabel,
+      paymentStatus,
+      paymentTransactionId,
       customerId: req.user!.id,
       customerEmail: req.user!.email,
     })
+
+    if (paymentTransactionId) {
+      await prisma.paymentTransaction.update({
+        where: { id: paymentTransactionId },
+        data: {
+          orderNumber: order.number,
+          orders: { connect: { number: order.number } },
+        },
+      })
+    }
+
     res.status(201).json({
       id: order.number,
       total: money(order.total),
       itemCount: order.items.reduce((sum, item) => sum + item.quantity, 0),
       deliveryType: order.deliveryType,
       paymentLabel: order.paymentLabel,
+      paymentStatus: order.paymentStatus,
+      transactionId,
       createdAt: order.createdAt.toISOString(),
       productSubtotal: money(order.productSubtotal),
       deliveryCharge: money(order.deliveryCharge),
@@ -303,7 +376,7 @@ customerOrderRouter.post('/', async (req, res, next) => {
 customerOrderRouter.get('/mine', async (req, res) => {
   const orders = await prisma.order.findMany({
     where: { customerId: req.user!.id },
-    include: { items: true, charges: true, store: true },
+    include: { items: true, charges: true, store: true, paymentTransaction: true },
     orderBy: { createdAt: 'desc' },
     take: 40,
   })
@@ -317,6 +390,7 @@ customerOrderRouter.get('/mine', async (req, res) => {
       storeName: order.store.name,
       deliveryType: order.deliveryType,
       paymentLabel: order.paymentLabel,
+      transactionId: order.paymentTransaction?.transactionId ?? null,
       createdAt: order.createdAt.toISOString(),
       itemCount: order.items.reduce((sum, item) => sum + item.quantity, 0),
       items: order.items.map((item) => ({
@@ -461,7 +535,7 @@ customerOrderRouter.get('/:number/receipt', async (req, res, next) => {
   try {
     const order = await prisma.order.findFirst({
       where: { number: req.params.number, customerId: req.user!.id },
-      include: { items: true, charges: true, store: true, rider: true },
+      include: { items: true, charges: true, store: true, rider: true, paymentTransaction: true },
     })
     if (!order) throw new HttpError(404, 'Order not found')
     const detail = mapOrderDetail(order)
@@ -473,7 +547,7 @@ customerOrderRouter.get('/:number/receipt', async (req, res, next) => {
           customerId: req.user!.id,
           NOT: { id: order.id },
         },
-        include: { items: true, charges: true, store: true, rider: true },
+        include: { items: true, charges: true, store: true, rider: true, paymentTransaction: true },
         orderBy: { createdAt: 'asc' },
       })
       related = siblings.map(mapOrderDetail)
@@ -515,6 +589,7 @@ customerOrderRouter.get('/:number', async (req, res, next) => {
         charges: true,
         store: true,
         rider: true,
+        paymentTransaction: true,
         activities: { orderBy: { createdAt: 'asc' } },
       },
     })

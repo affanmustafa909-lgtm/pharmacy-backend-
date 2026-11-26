@@ -77,6 +77,13 @@ enum PaymentStatus {
   partially_refunded
 }
 
+enum PaymentTxnStatus {
+  pending
+  processing
+  succeeded
+  failed
+}
+
 enum PrescriptionStatus {
   pending
   needs_clearer_photo
@@ -135,6 +142,7 @@ model User {
   addresses            CustomerAddress[]
   favorites            CustomerFavorite[]
   checkoutGroups       CheckoutGroup[]
+  paymentTransactions  PaymentTransaction[]
   stockAlerts          StockAlert[]
   notifications        CustomerNotification[]
   assignments          StoreAssignment[]
@@ -149,20 +157,50 @@ model User {
 }
 
 model CheckoutGroup {
-  id             String   @id @default(cuid())
+  id                   String              @id @default(cuid())
+  customerId           String
+  customer             User                @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  idempotencyKey       String              @unique
+  deliveryType         String
+  paymentLabel         String
+  paymentTransactionId String?             @unique
+  paymentTransaction   PaymentTransaction? @relation(fields: [paymentTransactionId], references: [id], onDelete: SetNull)
+  recipientName        String              @default("")
+  recipientPhone       String              @default("")
+  addressLine          String              @default("")
+  addressJson          Json?
+  createdAt            DateTime            @default(now())
+  orders               Order[]
+
+  @@index([customerId, createdAt])
+}
+
+/// Simulated card/cash payment attempts. Never stores CVV or full PAN — only last4 + brand.
+model PaymentTransaction {
+  id             String           @id @default(cuid())
+  transactionId  String           @unique
   customerId     String
-  customer       User     @relation(fields: [customerId], references: [id], onDelete: Cascade)
-  idempotencyKey String   @unique
-  deliveryType   String
-  paymentLabel   String
-  recipientName  String   @default("")
-  recipientPhone String   @default("")
-  addressLine    String   @default("")
-  addressJson    Json?
-  createdAt      DateTime @default(now())
+  customer       User             @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  amount         Decimal          @db.Decimal(12, 2)
+  currency       String           @default("USD")
+  method         String
+  status         PaymentTxnStatus @default(pending)
+  cardLast4      String           @default("")
+  cardBrand      String           @default("")
+  cardholderName String           @default("")
+  failureCode    String           @default("")
+  failureMessage String           @default("")
+  idempotencyKey String           @unique
+  orderNumber    String           @default("")
+  paidAt         DateTime?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  checkoutGroup  CheckoutGroup?
   orders         Order[]
 
   @@index([customerId, createdAt])
+  @@index([status, createdAt])
+  @@index([method, createdAt])
 }
 
 model StoreAssignment {
@@ -460,45 +498,48 @@ model ChargeRule {
 }
 
 model Order {
-  id                 String         @id @default(cuid())
-  number             String         @unique
-  customerId         String
-  customer           User           @relation(fields: [customerId], references: [id])
-  storeId            String
-  store              Store          @relation(fields: [storeId], references: [id])
-  checkoutGroupId    String?
-  checkoutGroup      CheckoutGroup? @relation(fields: [checkoutGroupId], references: [id], onDelete: SetNull)
-  riderId            String?
-  rider              Rider?         @relation(fields: [riderId], references: [id], onDelete: SetNull)
-  status             OrderStatus    @default(placed)
-  paymentStatus      PaymentStatus  @default(paid)
-  channel            String         @default("Mobile app")
-  deliveryType       String
-  paymentLabel       String
-  addressLine        String         @default("")
-  recipientName      String         @default("")
-  recipientPhone     String         @default("")
-  addressJson        Json?
-  deliveryDistanceKm Float?
-  prescriptionNumber String         @default("")
-  cancelReason       String         @default("")
-  refundReason       String         @default("")
-  refundAmount       Decimal        @default(0) @db.Decimal(12, 2)
-  productSubtotal    Decimal        @db.Decimal(12, 2)
-  deliveryCharge     Decimal        @db.Decimal(12, 2)
-  serviceCharge      Decimal        @db.Decimal(12, 2)
-  bfpCharge          Decimal        @db.Decimal(12, 2)
-  discount           Decimal        @default(0) @db.Decimal(12, 2)
-  total              Decimal        @db.Decimal(12, 2)
-  createdAt          DateTime       @default(now())
-  items              OrderItem[]
-  charges            OrderCharge[]
-  activities         OrderActivity[]
-  messages           OrderMessage[]
+  id                   String              @id @default(cuid())
+  number               String              @unique
+  customerId           String
+  customer             User                @relation(fields: [customerId], references: [id])
+  storeId              String
+  store                Store               @relation(fields: [storeId], references: [id])
+  checkoutGroupId      String?
+  checkoutGroup        CheckoutGroup?      @relation(fields: [checkoutGroupId], references: [id], onDelete: SetNull)
+  paymentTransactionId String?
+  paymentTransaction   PaymentTransaction? @relation(fields: [paymentTransactionId], references: [id], onDelete: SetNull)
+  riderId              String?
+  rider                Rider?              @relation(fields: [riderId], references: [id], onDelete: SetNull)
+  status               OrderStatus         @default(placed)
+  paymentStatus        PaymentStatus       @default(paid)
+  channel              String              @default("Mobile app")
+  deliveryType         String
+  paymentLabel         String
+  addressLine          String              @default("")
+  recipientName        String              @default("")
+  recipientPhone       String              @default("")
+  addressJson          Json?
+  deliveryDistanceKm   Float?
+  prescriptionNumber   String              @default("")
+  cancelReason         String              @default("")
+  refundReason         String              @default("")
+  refundAmount         Decimal             @default(0) @db.Decimal(12, 2)
+  productSubtotal      Decimal             @db.Decimal(12, 2)
+  deliveryCharge       Decimal             @db.Decimal(12, 2)
+  serviceCharge        Decimal             @db.Decimal(12, 2)
+  bfpCharge            Decimal             @db.Decimal(12, 2)
+  discount             Decimal             @default(0) @db.Decimal(12, 2)
+  total                Decimal             @db.Decimal(12, 2)
+  createdAt            DateTime            @default(now())
+  items                OrderItem[]
+  charges              OrderCharge[]
+  activities           OrderActivity[]
+  messages             OrderMessage[]
 
   @@index([storeId, createdAt])
   @@index([customerId])
   @@index([checkoutGroupId])
+  @@index([paymentTransactionId])
   @@index([riderId, status])
   @@index([status])
   @@index([paymentStatus])

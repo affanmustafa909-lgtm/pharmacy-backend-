@@ -109,12 +109,19 @@ export function formatAddressLine(parts: {
   return composed || (parts.fallback?.trim() ?? '')
 }
 
-export async function searchPlaces(query: string, limit = 6): Promise<GeocodedPlace[]> {
+export async function searchPlaces(
+  query: string,
+  limit = 6,
+  options?: { countryCodes?: string },
+): Promise<GeocodedPlace[]> {
   const q = query.trim()
   if (q.length < 2) return []
 
+  const country = options?.countryCodes?.trim()
+    ? `&countrycodes=${encodeURIComponent(options.countryCodes.trim())}`
+    : ''
   const url = nominatimUrl(
-    `/search?format=jsonv2&addressdetails=1&limit=${Math.min(limit, 10)}&q=${encodeURIComponent(q)}`,
+    `/search?format=jsonv2&addressdetails=1&limit=${Math.min(limit, 10)}&q=${encodeURIComponent(q)}${country}`,
   )
   try {
     const response = await fetch(url, {
@@ -147,6 +154,16 @@ export async function reverseGeocode(lat: number, lng: number): Promise<Geocoded
   }
 }
 
+function resolveCountryCodes(country?: string) {
+  const value = String(country ?? '').trim().toLowerCase()
+  if (!value) return 'pk'
+  if (value === 'pk' || value === 'pakistan' || value.includes('pakistan')) return 'pk'
+  if (value === 'us' || value === 'usa' || value === 'united states' || value.includes('united states')) {
+    return 'us'
+  }
+  return undefined
+}
+
 export async function geocodeStructuredAddress(parts: {
   street?: string
   subCity?: string
@@ -156,15 +173,22 @@ export async function geocodeStructuredAddress(parts: {
   country?: string
   line?: string
 }): Promise<GeocodedPlace | null> {
+  const countryCodes = resolveCountryCodes(parts.country)
+  const biasedLine =
+    countryCodes === 'pk' && parts.line && !/pakistan|karachi|lahore|islamabad/i.test(parts.line)
+      ? `${parts.line}, Pakistan`
+      : parts.line?.trim() ?? ''
   const queries = [
-    formatAddressLine(parts),
-    [parts.subCity, parts.city, parts.state, parts.country].filter(Boolean).join(', '),
-    [parts.city, parts.country].filter(Boolean).join(', '),
-    parts.line?.trim() ?? '',
+    formatAddressLine({ ...parts, country: parts.country || (countryCodes === 'pk' ? 'Pakistan' : parts.country) }),
+    [parts.subCity, parts.city, parts.state, parts.country || (countryCodes === 'pk' ? 'Pakistan' : '')]
+      .filter(Boolean)
+      .join(', '),
+    [parts.city, parts.country || (countryCodes === 'pk' ? 'Pakistan' : '')].filter(Boolean).join(', '),
+    biasedLine,
   ].filter((q, idx, arr) => q.length >= 2 && arr.indexOf(q) === idx)
 
   for (const query of queries) {
-    const results = await searchPlaces(query, 1)
+    const results = await searchPlaces(query, 1, countryCodes ? { countryCodes } : undefined)
     if (results.length > 0) return results[0]
   }
   return null

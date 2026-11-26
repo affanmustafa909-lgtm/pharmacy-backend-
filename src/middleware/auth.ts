@@ -23,6 +23,19 @@ export function requireAuth(req: Request, _res: Response, next: NextFunction) {
   }
 }
 
+/** Attach user when a valid Bearer token is present; otherwise continue as guest. */
+export function optionalAuth(req: Request, _res: Response, next: NextFunction) {
+  const header = req.header('authorization') ?? ''
+  const token = header.startsWith('Bearer ') ? header.slice(7) : ''
+  if (!token) return next()
+  try {
+    req.user = verifyToken(token)
+  } catch {
+    // Ignore invalid tokens on public catalog routes.
+  }
+  return next()
+}
+
 export function requireRole(...roles: Role[]) {
   return (req: Request, _res: Response, next: NextFunction) => {
     if (!req.user || !roles.includes(req.user.role)) return next(new HttpError(403, 'You do not have access to this'))

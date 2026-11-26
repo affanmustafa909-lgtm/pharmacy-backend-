@@ -121,7 +121,16 @@ export function getStoreOrderEligibility(
       return { eligible: true, reason: null }
     }
 
-    hours = weeklyHours[local.day]
+    const fullDay: Record<string, string> = {
+      sun: 'sunday',
+      mon: 'monday',
+      tue: 'tuesday',
+      wed: 'wednesday',
+      thu: 'thursday',
+      fri: 'friday',
+      sat: 'saturday',
+    }
+    hours = weeklyHours[local.day] ?? weeklyHours[fullDay[local.day] ?? '']
   }
 
   if (!isRecord(hours) || !validTime(hours.open) || !validTime(hours.close)) {
@@ -131,11 +140,17 @@ export function getStoreOrderEligibility(
   const opening = timeMinutes(hours.open)
   const closing = timeMinutes(hours.close)
 
-  if (closing <= opening) {
+  // Overnight window (e.g. 20:00 → 02:00) or normal same-day window.
+  if (closing === opening) {
     return unavailable('Store hours are incorrectly configured')
   }
 
-  if (local.minutes < opening || local.minutes >= closing) {
+  if (closing < opening) {
+    // Open across midnight.
+    if (local.minutes < opening && local.minutes >= closing) {
+      return unavailable('Outside working hours')
+    }
+  } else if (local.minutes < opening || local.minutes >= closing) {
     return unavailable('Outside working hours')
   }
 

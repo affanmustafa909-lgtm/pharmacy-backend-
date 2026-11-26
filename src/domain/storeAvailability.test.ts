@@ -111,3 +111,30 @@ test('holiday hours override normal weekly hours', () => {
   )
   assert.equal(result.eligible, false)
 })
+
+test('overnight hours stay open before midnight', () => {
+  const result = getStoreOrderEligibility(
+    {
+      ...baseStore,
+      weeklyHours: {
+        ...baseStore.weeklyHours,
+        mon: { open: '20:00', close: '02:00' },
+      },
+    },
+    new Date('2026-11-23T16:00:00.000Z'), // Monday 21:00 PKT
+  )
+  assert.equal(result.eligible, true)
+})
+
+test('full weekday keys are accepted', () => {
+  const result = getStoreOrderEligibility(
+    {
+      ...baseStore,
+      weeklyHours: {
+        monday: { open: '09:00', close: '22:00' },
+      },
+    },
+    new Date('2026-11-23T05:00:00.000Z'),
+  )
+  assert.equal(result.eligible, true)
+})

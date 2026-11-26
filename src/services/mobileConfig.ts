@@ -15,7 +15,7 @@ export type MobileDeliveryOption = {
 
 export type MobilePaymentMethod = {
   id: string
-  type: 'apple_pay' | 'card' | 'other'
+  type: 'apple_pay' | 'card' | 'debit_card' | 'credit_card' | 'cod' | 'other'
   label: string
   detail?: string
 }
@@ -57,8 +57,9 @@ export const DEFAULT_MOBILE_CONFIG: MobileConfig = {
     { id: 'pickup', title: 'Store Pickup', eta: 'Ready in 30-45 min', priceLabel: 'Free' },
   ],
   paymentMethods: [
-    { id: 'apple', type: 'apple_pay', label: 'Apple Pay' },
-    { id: 'visa', type: 'card', label: 'Visa', detail: '•••• 4829' },
+    { id: 'cod', type: 'cod', label: 'Cash on Delivery' },
+    { id: 'debit', type: 'debit_card', label: 'Debit Card', detail: 'TEST MODE' },
+    { id: 'credit', type: 'credit_card', label: 'Credit Card', detail: 'TEST MODE' },
   ],
   aiMessages: [
     {
@@ -86,6 +87,48 @@ export const DEFAULT_MOBILE_CONFIG: MobileConfig = {
   },
 }
 
+function normalizePaymentMethods(raw: unknown): MobilePaymentMethod[] {
+  const list = Array.isArray(raw) ? (raw as MobilePaymentMethod[]) : []
+  const hasSimCards = list.some(
+    (method) =>
+      method?.type === 'debit_card' ||
+      method?.type === 'credit_card' ||
+      (method?.type === 'card' && /test/i.test(String(method.detail ?? ''))),
+  )
+  // Replace legacy Apple Pay / saved Visa configs with the TEST MODE simulation set.
+  if (!list.length || !hasSimCards) {
+    return DEFAULT_MOBILE_CONFIG.paymentMethods
+  }
+
+  const cleaned = list
+    .filter((method) => method && method.type !== 'apple_pay')
+    .map((method) => {
+      if (method.type === 'card' && !/test/i.test(String(method.detail ?? ''))) {
+        return {
+          ...method,
+          type: 'debit_card' as const,
+          label: method.label?.trim() || 'Debit Card',
+          detail: 'TEST MODE',
+        }
+      }
+      if (method.type === 'debit_card' || method.type === 'credit_card') {
+        return { ...method, detail: method.detail?.trim() || 'TEST MODE' }
+      }
+      return method
+    })
+
+  const withCod = cleaned.some((method) => method.type === 'cod' || method.id === 'cod')
+    ? cleaned
+    : [{ id: 'cod', type: 'cod' as const, label: 'Cash on Delivery' }, ...cleaned]
+
+  const hasDebit = withCod.some((method) => method.type === 'debit_card' || method.id === 'debit')
+  const hasCredit = withCod.some((method) => method.type === 'credit_card' || method.id === 'credit')
+  const next = [...withCod]
+  if (!hasDebit) next.push({ id: 'debit', type: 'debit_card', label: 'Debit Card', detail: 'TEST MODE' })
+  if (!hasCredit) next.push({ id: 'credit', type: 'credit_card', label: 'Credit Card', detail: 'TEST MODE' })
+  return next
+}
+
 export function normalizeMobileConfig(raw: unknown): MobileConfig {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return DEFAULT_MOBILE_CONFIG
   const value = raw as Partial<MobileConfig>
@@ -98,9 +141,7 @@ export function normalizeMobileConfig(raw: unknown): MobileConfig {
     deliveryOptions: Array.isArray(value.deliveryOptions) && value.deliveryOptions.length
       ? value.deliveryOptions
       : DEFAULT_MOBILE_CONFIG.deliveryOptions,
-    paymentMethods: Array.isArray(value.paymentMethods) && value.paymentMethods.length
-      ? value.paymentMethods
-      : DEFAULT_MOBILE_CONFIG.paymentMethods,
+    paymentMethods: normalizePaymentMethods(value.paymentMethods),
     aiMessages: Array.isArray(value.aiMessages) && value.aiMessages.length
       ? value.aiMessages
       : DEFAULT_MOBILE_CONFIG.aiMessages,

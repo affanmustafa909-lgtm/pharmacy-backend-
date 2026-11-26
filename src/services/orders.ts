@@ -10,6 +10,7 @@ import { getDeliveryDistanceKm } from './distance.js'
 import { formatAddressLine as formatCustomerLine } from './deliveryAddress.js'
 import { geocodeStructuredAddress } from './geocode.js'
 import { dec, money } from './money.js'
+import { attachPaymentToCheckout, claimPaymentForCheckout } from './payments.js'
 import { findAssignedRiderForStore } from './riders.js'
 
 export type DeliveryType = 'standard' | 'express' | 'pickup'
@@ -259,6 +260,7 @@ export async function placeOrder(input: {
   deliveryType: DeliveryType
   paymentLabel: string
   paymentStatus?: 'paid' | 'unpaid'
+  paymentTransactionId?: string
   addressLine: string
   recipientName?: string
   recipientPhone?: string
@@ -336,6 +338,7 @@ export async function placeOrder(input: {
         customerId: input.customerId,
         storeId: input.storeId,
         checkoutGroupId: input.checkoutGroupId,
+        paymentTransactionId: input.paymentTransactionId,
         riderId: assignedRider?.id ?? null,
         status: 'placed',
         paymentStatus,
@@ -516,6 +519,14 @@ export function mapOrderDetail(order: {
   serviceCharge: Prisma.Decimal
   bfpCharge: Prisma.Decimal
   prescriptionNumber: string
+  paymentTransaction?: {
+    transactionId: string
+    method: string
+    status: string
+    cardLast4: string
+    cardBrand: string
+    paidAt: Date | null
+  } | null
   items: Array<{
     name: string
     sku: string
@@ -575,6 +586,11 @@ export function mapOrderDetail(order: {
     discount: money(order.discount),
     deliveryType: order.deliveryType,
     paymentLabel: order.paymentLabel,
+    transactionId: order.paymentTransaction?.transactionId ?? null,
+    paymentMethod: order.paymentTransaction?.method ?? null,
+    cardLast4: order.paymentTransaction?.cardLast4 || null,
+    cardBrand: order.paymentTransaction?.cardBrand || null,
+    paidAt: order.paymentTransaction?.paidAt?.toISOString() ?? null,
     addressLine: order.addressLine,
     recipientName: String(order.recipientName ?? '').trim() || null,
     recipientPhone: String(order.recipientPhone ?? '').trim() || null,
@@ -726,7 +742,7 @@ export function receiptHtml(
     <div class="brand"><div class="mark">H</div><div><h1>Hera Pharmacy</h1><div class="sub">Official order receipt</div></div></div>
     <div class="meta">
       <div class="cell"><div class="label">Date</div><div class="value">${new Date(detail.createdAt).toLocaleString()}</div></div>
-      <div class="cell"><div class="label">Payment</div><div class="value">${detail.paymentLabel} · ${detail.paymentStatus}</div></div>
+      <div class="cell"><div class="label">Payment</div><div class="value">${detail.paymentLabel} · ${detail.paymentStatus}${detail.transactionId ? ` · ${detail.transactionId}` : ''}</div></div>
     </div>
     <div class="addr">
       <div class="label">${detail.deliveryType === 'pickup' ? 'Pickup' : 'Deliver to'}</div>
@@ -832,6 +848,7 @@ export async function placeMultiStoreCheckout(input: {
   deliveryType: DeliveryType
   paymentLabel: string
   paymentStatus?: 'paid' | 'unpaid'
+  paymentTransactionId?: string
   recipientName: string
   recipientPhone: string
   addressLine: string
@@ -844,7 +861,18 @@ export async function placeMultiStoreCheckout(input: {
 }) {
   const existing = await prisma.checkoutGroup.findUnique({
     where: { idempotencyKey: input.idempotencyKey },
-    include: { orders: { include: { items: true, charges: true, store: true, rider: true } } },
+    include: {
+      orders: {
+        include: {
+          items: true,
+          charges: true,
+          store: true,
+          rider: true,
+          paymentTransaction: true,
+        },
+      },
+      paymentTransaction: true,
+    },
   })
   if (existing) {
     return {
@@ -852,6 +880,7 @@ export async function placeMultiStoreCheckout(input: {
       orders: existing.orders,
       combinedTotal: existing.orders.reduce((sum, order) => sum + money(order.total), 0),
       reused: true,
+      paymentTransaction: existing.paymentTransaction,
     }
   }
 
@@ -878,12 +907,30 @@ export async function placeMultiStoreCheckout(input: {
     throw new HttpError(400, 'Add recipient name and phone number')
   }
 
+  const isCod =
+    /cash on delivery|^cod$/i.test(input.paymentLabel) || input.paymentStatus === 'unpaid'
+  let paymentLabel = input.paymentLabel
+  let paymentStatus: 'paid' | 'unpaid' = isCod ? 'unpaid' : input.paymentStatus === 'unpaid' ? 'unpaid' : 'paid'
+  let paymentTransactionId: string | undefined
+
+  if (input.paymentTransactionId) {
+    const claimed = await claimPaymentForCheckout({
+      customerId: input.customerId,
+      paymentTransactionId: input.paymentTransactionId,
+      expectedAmount: plan.combinedTotal,
+      paymentLabel: input.paymentLabel,
+    })
+    paymentTransactionId = claimed.txn.id
+    paymentLabel = claimed.paymentLabel
+    paymentStatus = 'paid'
+  }
+
   const group = await prisma.checkoutGroup.create({
     data: {
       customerId: input.customerId,
       idempotencyKey: input.idempotencyKey,
       deliveryType: input.deliveryType,
-      paymentLabel: input.paymentLabel,
+      paymentLabel,
       recipientName: input.recipientName.trim(),
       recipientPhone: input.recipientPhone.trim(),
       addressLine: input.addressLine,
@@ -892,32 +939,54 @@ export async function placeMultiStoreCheckout(input: {
   })
 
   const orders = []
-  for (const storePlan of plan.stores) {
-    const order = await placeOrder({
-      customerId: input.customerId,
-      customerEmail: input.customerEmail,
-      storeId: storePlan.storeId,
-      addressId,
-      deliveryType: input.deliveryType,
-      paymentLabel: input.paymentLabel,
-      paymentStatus: input.paymentStatus,
-      addressLine: input.addressLine,
-      recipientName: input.recipientName,
-      recipientPhone: input.recipientPhone,
-      addressJson: input.addressJson,
-      checkoutGroupId: group.id,
-      items: storePlan.items.map((item) => ({ productId: item.productId, quantity: item.quantity })),
-      promoCode: input.promoCode,
-      prescriptionNumber: input.prescriptionNumber,
-    })
-    orders.push(order)
+  try {
+    for (const storePlan of plan.stores) {
+      const order = await placeOrder({
+        customerId: input.customerId,
+        customerEmail: input.customerEmail,
+        storeId: storePlan.storeId,
+        addressId,
+        deliveryType: input.deliveryType,
+        paymentLabel,
+        paymentStatus,
+        paymentTransactionId,
+        addressLine: input.addressLine,
+        recipientName: input.recipientName,
+        recipientPhone: input.recipientPhone,
+        addressJson: input.addressJson,
+        checkoutGroupId: group.id,
+        items: storePlan.items.map((item) => ({ productId: item.productId, quantity: item.quantity })),
+        promoCode: input.promoCode,
+        prescriptionNumber: input.prescriptionNumber,
+      })
+      orders.push(order)
+    }
+  } catch (error) {
+    // Leave a successful simulated payment reusable when no orders were created.
+    if (orders.length === 0) {
+      await prisma.checkoutGroup.delete({ where: { id: group.id } }).catch(() => undefined)
+    }
+    throw error
   }
+
+  if (paymentTransactionId) {
+    await attachPaymentToCheckout({
+      paymentTransactionId,
+      checkoutGroupId: group.id,
+      orderNumbers: orders.map((order) => order.number),
+    })
+  }
+
+  const paymentTransaction = paymentTransactionId
+    ? await prisma.paymentTransaction.findUnique({ where: { id: paymentTransactionId } })
+    : null
 
   return {
     checkoutGroupId: group.id,
     orders,
     combinedTotal: Math.round(orders.reduce((sum, order) => sum + money(order.total), 0) * 100) / 100,
     reused: false,
+    paymentTransaction,
   }
 }
 

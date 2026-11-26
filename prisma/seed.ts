@@ -15,6 +15,8 @@ async function wipeAll() {
   await prisma.orderCharge.deleteMany()
   await prisma.orderItem.deleteMany()
   await prisma.order.deleteMany()
+  await prisma.checkoutGroup.deleteMany()
+  await prisma.paymentTransaction.deleteMany()
   await prisma.stockMovement.deleteMany()
   await prisma.inventoryBatch.deleteMany()
   await prisma.storeDeliveryOption.deleteMany()
@@ -58,60 +60,70 @@ async function main() {
     console.log('Set FORCE_SEED=1 to fully reset the database.')
   }
 
+  // Hours use Asia/Karachi. Keep late close so evening app orders still work.
   const defaultHours = {
-    mon: { open: '09:00', close: '22:00' },
-    tue: { open: '09:00', close: '22:00' },
-    wed: { open: '09:00', close: '22:00' },
-    thu: { open: '09:00', close: '22:00' },
-    fri: { open: '09:00', close: '22:00' },
-    sat: { open: '10:00', close: '20:00' },
-    sun: { open: '10:00', close: '18:00' },
+    mon: { open: '09:00', close: '23:59' },
+    tue: { open: '09:00', close: '23:59' },
+    wed: { open: '09:00', close: '23:59' },
+    thu: { open: '09:00', close: '23:59' },
+    fri: { open: '09:00', close: '23:59' },
+    sat: { open: '10:00', close: '23:59' },
+    sun: { open: '10:00', close: '23:00' },
   }
 
+  // Pins are in Karachi so PK customer map pins (and emulator PK seeds) get coverage.
   const storeDefs = [
     {
       code: 'ALI',
       name: 'Ali Pharmacy',
-      address: '245 Park Ave, New York, NY',
-      openUntil: '10:00 PM',
+      address: 'Shop 12, Tariq Road, PECHS, Karachi',
+      city: 'Karachi',
+      openUntil: '11:59 PM',
       pharmacist: 'Ava Patel',
-      phone: '+1 (212) 555-0100',
+      phone: '+92 21 111 000 111',
       rating: 4.9,
-      mapLat: 40.7549,
-      mapLng: -73.974,
+      mapLat: 24.8732,
+      mapLng: 67.0615,
+      maxDeliveryDistanceKm: 40,
     },
     {
       code: 'CTY',
       name: 'City Pharmacy',
-      address: '180 8th Ave, New York, NY',
-      openUntil: '9:00 PM',
+      address: 'Near Teen Talwar, Clifton, Karachi',
+      city: 'Karachi',
+      openUntil: '11:59 PM',
       pharmacist: 'Leo Martins',
-      phone: '+1 (212) 555-0108',
+      phone: '+92 21 111 000 222',
       rating: 4.7,
-      mapLat: 40.742,
-      mapLng: -74.001,
+      mapLat: 24.8138,
+      mapLng: 67.0225,
+      maxDeliveryDistanceKm: 40,
     },
     {
       code: 'HCP',
       name: 'Health Care Pharmacy',
-      address: '920 Lexington Ave, New York, NY',
-      openUntil: '8:00 PM',
+      address: 'Bahadurabad Chowrangi, Karachi',
+      city: 'Karachi',
+      openUntil: '11:59 PM',
       pharmacist: 'Mina Rahman',
-      phone: '+1 (212) 555-0119',
+      phone: '+92 21 111 000 333',
       rating: 4.8,
-      mapLat: 40.7701,
-      mapLng: -73.9642,
+      mapLat: 24.8821,
+      mapLng: 67.0683,
+      maxDeliveryDistanceKm: 40,
     },
     {
       code: 'NEW',
       name: 'New Branch Pharmacy',
-      address: '100 Broadway, New York, NY',
-      openUntil: '9:00 PM',
+      address: 'DHA Phase 6, Karachi',
+      city: 'Karachi',
+      openUntil: '11:59 PM',
       pharmacist: 'Nina Manager',
-      phone: '+1 (212) 555-0199',
+      phone: '+92 21 111 000 444',
       rating: 4.6,
-      mapLat: 40.7074,
-      mapLng: -74.0113,
+      mapLat: 24.8025,
+      mapLng: 67.0642,
+      maxDeliveryDistanceKm: 40,
     },
   ] as const
 
@@ -129,6 +141,7 @@ async function main() {
       update: {
         name: def.name,
         address: def.address,
+        city: def.city,
         openUntil: def.openUntil,
         pharmacist: def.pharmacist,
         phone: def.phone,
@@ -139,6 +152,7 @@ async function main() {
         isOpen: true,
         mapLat: def.mapLat,
         mapLng: def.mapLng,
+        maxDeliveryDistanceKm: def.maxDeliveryDistanceKm,
       },
     })
     stores[def.code] = store
@@ -415,10 +429,15 @@ async function main() {
     if (optionCount === 0) {
       await prisma.storeDeliveryOption.createMany({
         data: [
-          { storeId: store.id, type: 'standard', label: 'Standard', available: true, fee: dec(code === 'CTY' ? 4 : 3.5), etaMinutes: 60, deliveryArea: 'Manhattan' },
-          { storeId: store.id, type: 'express', label: 'Express', available: true, fee: dec(code === 'CTY' ? 7 : 6.5), etaMinutes: 30, deliveryArea: 'Manhattan' },
+          { storeId: store.id, type: 'standard', label: 'Standard', available: true, fee: dec(code === 'CTY' ? 4 : 3.5), etaMinutes: 60, deliveryArea: 'Karachi' },
+          { storeId: store.id, type: 'express', label: 'Express', available: true, fee: dec(code === 'CTY' ? 7 : 6.5), etaMinutes: 30, deliveryArea: 'Karachi' },
           { storeId: store.id, type: 'pickup', label: 'Pickup', available: true, fee: dec(0), etaMinutes: 20, deliveryArea: '' },
         ],
+      })
+    } else {
+      await prisma.storeDeliveryOption.updateMany({
+        where: { storeId: store.id, type: { in: ['standard', 'express'] } },
+        data: { deliveryArea: 'Karachi', available: true },
       })
     }
   }

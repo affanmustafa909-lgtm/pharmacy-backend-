@@ -1,10 +1,14 @@
 import type { ChargeRule } from '@prisma/client'
 import { calculateCharges, type ChargeRuleInput } from '../domain/charges.js'
+import { getStoreOrderEligibility } from '../domain/storeAvailability.js'
 import { prisma } from '../lib/prisma.js'
 import { formatAddressLine, geocodeStructuredAddress } from './geocode.js'
 import { haversineDistanceKm } from './distance.js'
 import { formatAddressLine as formatCustomerLine, storeCoversArea } from './deliveryAddress.js'
 import { money } from './money.js'
+
+/** Ignore geocoder hits that land far from every pharmacy pin (e.g. "sdf" → Iran). */
+const GEOCODE_OUTLIER_KM = 80
 
 function toRule(rule: ChargeRule): ChargeRuleInput {
   return {
@@ -34,40 +38,51 @@ export type NearbyAddress = {
 
 export async function findNearbyStores(input: {
   address: NearbyAddress
+  addressId?: string
+  customerId?: string
   skus?: { sku: string; quantity: number }[]
   deliveryType?: 'standard' | 'express' | 'pickup'
 }) {
-  const line =
-    formatCustomerLine({
-      houseNo: input.address.houseNo,
-      street: input.address.street,
-      area: input.address.area,
-      city: input.address.city,
-      landmark: input.address.landmark,
-      line: input.address.line,
-    }) ||
-    formatAddressLine({
-      street: input.address.street,
-      subCity: input.address.area,
-      city: input.address.city,
-      fallback: input.address.line,
-    }) ||
-    String(input.address.line ?? '').trim()
+  let address = { ...input.address }
 
-  let lat = input.address.lat ?? null
-  let lng = input.address.lng ?? null
-  if ((lat == null || lng == null) && line) {
-    const geocoded = await geocodeStructuredAddress({
-      street: [input.address.houseNo, input.address.street].filter(Boolean).join(' '),
-      subCity: input.address.area,
-      city: input.address.city,
-      line,
+  if (input.addressId && input.customerId) {
+    const saved = await prisma.customerAddress.findFirst({
+      where: { id: input.addressId, customerId: input.customerId },
     })
-    if (geocoded) {
-      lat = geocoded.latitude
-      lng = geocoded.longitude
+    if (saved) {
+      address = {
+        houseNo: saved.houseNo || address.houseNo,
+        street: saved.street || address.street,
+        area: saved.subCity || address.area,
+        city: saved.city || address.city,
+        landmark: saved.landmark || address.landmark,
+        line: saved.line || address.line,
+        lat: saved.latitude ?? address.lat ?? null,
+        lng: saved.longitude ?? address.lng ?? null,
+      }
     }
   }
+
+  const line =
+    formatCustomerLine({
+      houseNo: address.houseNo,
+      street: address.street,
+      area: address.area,
+      city: address.city,
+      landmark: address.landmark,
+      line: address.line,
+    }) ||
+    formatAddressLine({
+      street: address.street,
+      subCity: address.area,
+      city: address.city,
+      fallback: address.line,
+    }) ||
+    String(address.line ?? '').trim()
+
+  let lat = address.lat ?? null
+  let lng = address.lng ?? null
+  const hadPinnedCoords = lat != null && lng != null
 
   const stores = await prisma.store.findMany({
     where: { status: 'active', isOpen: true, acceptingOrders: true },
@@ -88,6 +103,41 @@ export async function findNearbyStores(input: {
     orderBy: { name: 'asc' },
   })
 
+  if ((lat == null || lng == null) && line) {
+    try {
+      const geocoded = await Promise.race([
+        geocodeStructuredAddress({
+          street: [address.houseNo, address.street].filter(Boolean).join(' '),
+          subCity: address.area,
+          city: address.city,
+          line,
+          country: 'Pakistan',
+        }),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 4000)),
+      ])
+      if (geocoded) {
+        const nearestKm = stores
+          .filter((store) => store.mapLat != null && store.mapLng != null)
+          .map((store) =>
+            haversineDistanceKm({
+              fromLat: store.mapLat!,
+              fromLng: store.mapLng!,
+              toLat: geocoded.latitude,
+              toLng: geocoded.longitude,
+            }),
+          )
+          .sort((a, b) => a - b)[0]
+        // Fake / ambiguous text like "sdf" can resolve overseas — ignore those pins.
+        if (nearestKm == null || nearestKm <= GEOCODE_OUTLIER_KM) {
+          lat = geocoded.latitude
+          lng = geocoded.longitude
+        }
+      }
+    } catch {
+      // Geocoder outages must not break checkout coverage checks.
+    }
+  }
+
   const deliveryType = input.deliveryType ?? 'standard'
   const skuQty = new Map((input.skus ?? []).map((item) => [item.sku, item.quantity]))
   const hasCustomerGeo = lat != null && lng != null
@@ -107,6 +157,8 @@ export async function findNearbyStores(input: {
     const zone = String(deliveryArea ?? '').trim().toLowerCase()
     return !zone || zone === 'local delivery area' || zone === 'all'
   }
+
+  const closedInRangeReasons = new Map<string, string>()
 
   let rows = stores
     .map((store) => {
@@ -132,7 +184,7 @@ export async function findNearbyStores(input: {
           option.available &&
           option.type !== 'pickup' &&
           !isOpenEndedArea(option.deliveryArea) &&
-          storeCoversArea(option.deliveryArea, { ...input.address, line }),
+          storeCoversArea(option.deliveryArea, { ...address, line }),
       )
 
       const openEndedTextCovers =
@@ -140,22 +192,30 @@ export async function findNearbyStores(input: {
           (option) =>
             option.available && option.type !== 'pickup' && isOpenEndedArea(option.deliveryArea),
         ) ||
-        (store.deliveryOptions.length === 0 && storeCoversArea('all', { ...input.address, line }))
+        (store.deliveryOptions.length === 0 && storeCoversArea('all', { ...address, line }))
 
       let covers = false
       if (deliveryType === 'pickup') {
         covers = true
       } else if (hasCustomerGeo && hasStoreGeo) {
-        // Pin-to-pin distance is authoritative when both sides have GPS.
-        covers = geoCovers
+        // Prefer pin distance; still allow a clear named delivery-area match
+        // (e.g. "Karachi") when the pin is slightly off or from a rough map seed.
+        covers = geoCovers || explicitTextCovers
       } else if (hasCustomerGeo && !hasStoreGeo) {
-        // Store has no map pin — never treat "Local delivery area" as worldwide.
+        // No store pin: named zones only — not open-ended "Local delivery area"
+        // (that would make every address worldwide).
         covers = explicitTextCovers
       } else {
         covers = explicitTextCovers || openEndedTextCovers
       }
 
       if (!covers) return null
+
+      const eligibility = getStoreOrderEligibility(store)
+      if (!eligibility.eligible) {
+        closedInRangeReasons.set(store.id, eligibility.reason ?? 'Currently closed')
+        return null
+      }
 
       const option =
         store.deliveryOptions.find((item) => item.type === deliveryType && item.available) ??
@@ -221,8 +281,16 @@ export async function findNearbyStores(input: {
   const fulfillable = wantedSkus > 0 ? rows.filter((row) => row.canFulfillAll) : rows
   let message: string | null = null
   if (rows.length === 0) {
-    message =
-      'No pharmacy can deliver to this address right now. Change the address or choose store pickup.'
+    if (closedInRangeReasons.size > 0) {
+      const reason = [...closedInRangeReasons.values()][0]
+      message = `${reason}. Nearby pharmacies are closed for delivery right now. Try store pickup or order later.`
+    } else if (!hadPinnedCoords && !hasCustomerGeo) {
+      message =
+        'Confirm the map pin on your address. We could not match this location to a delivery area.'
+    } else {
+      message =
+        'No pharmacy can deliver to this address right now. Change the address or choose store pickup.'
+    }
   } else if (wantedSkus > 0 && fulfillable.length === 0) {
     message =
       'Nearby pharmacies are in range, but none have all cart items in stock. Change items or choose store pickup.'
@@ -234,7 +302,7 @@ export async function findNearbyStores(input: {
   }
 
   return {
-    address: { ...input.address, line, lat, lng },
+    address: { ...address, line, lat, lng },
     stores: rows,
     message,
   }

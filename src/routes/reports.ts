@@ -32,7 +32,7 @@ const querySchema = z.object({
   from: z.string().optional(),
   to: z.string().optional(),
   storeId: z.string().optional(),
-  type: z.enum(['all', 'order', 'prescription', 'product', 'service', 'charge']).optional(),
+  type: z.enum(['all', 'order', 'prescription', 'product', 'service', 'charge', 'payment']).optional(),
   status: z.string().optional(),
   paymentMethod: z.string().optional(),
   q: z.string().optional(),
@@ -159,6 +159,52 @@ async function collect(storeIds: string[] | null, query: z.infer<typeof querySch
       })
     })
   }
+  if (type === 'all' || type === 'payment') {
+    const paymentStatusFilter =
+      query.status === 'succeeded' || query.status === 'failed' || query.status === 'pending' || query.status === 'processing'
+        ? (query.status as 'succeeded' | 'failed' | 'pending' | 'processing')
+        : undefined
+    const payments = await prisma.paymentTransaction.findMany({
+      where: {
+        ...(createdAt ? { createdAt } : {}),
+        ...(paymentStatusFilter ? { status: paymentStatusFilter } : {}),
+        ...(storeIds
+          ? {
+              OR: [
+                { orders: { some: { storeId: { in: storeIds } } } },
+                { orders: { none: {} }, status: 'failed' },
+              ],
+            }
+          : {}),
+      },
+      include: {
+        customer: true,
+        orders: { include: { store: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: ROW_LIMIT,
+    })
+    if (payments.length >= ROW_LIMIT) truncated = true
+    payments.forEach((payment) => {
+      const label = payment.method === 'credit_card' ? 'Credit Card' : payment.method === 'debit_card' ? 'Debit Card' : payment.method
+      if (paymentMethod && !label.toLowerCase().includes(paymentMethod) && !payment.method.toLowerCase().includes(paymentMethod)) {
+        return
+      }
+      rows.push({
+        id: payment.id,
+        occurredAt: payment.createdAt.toISOString(),
+        storeName: payment.orders.map((order) => order.store.name).filter(Boolean).join(' · ') || '—',
+        recordType: 'payment',
+        status: payment.status,
+        name: `${payment.customer.name} · ${payment.cardBrand || 'Card'} •••• ${payment.cardLast4 || '----'}`,
+        amount: money(payment.amount),
+        reference: payment.transactionId,
+        paymentLabel: label,
+        paymentStatus: payment.status === 'succeeded' ? 'paid' : payment.status,
+      })
+    })
+  }
+
   if (type === 'all' || type === 'service') {
     const services = await prisma.service.findMany({
       where: { ...storeFilter, ...(createdAt ? { createdAt } : {}) },

@@ -3,7 +3,7 @@ import { Router } from 'express'
 import { isExpired } from '../lib/expiry.js'
 import { HttpError } from '../lib/http.js'
 import { prisma } from '../lib/prisma.js'
-import { requireAuth, requireRole } from '../middleware/auth.js'
+import { optionalAuth, requireAuth, requireRole } from '../middleware/auth.js'
 import { isSellable, mapCatalogProduct } from '../services/catalogMap.js'
 import { DEFAULT_MAX_DELIVERY_DISTANCE_KM, resolveStoreCity } from '../domain/deliveryArea.js'
 import { filterStoresAvailableToCustomer } from '../services/availableStores.js'
@@ -64,7 +64,7 @@ catalogRouter.get('/promos/validate', async (req, res, next) => {
   }
 })
 
-catalogRouter.get('/stores', async (req, res, next) => {
+catalogRouter.get('/stores', optionalAuth, async (req, res, next) => {
   try {
     const addressId = String(req.query.addressId ?? '').trim() || undefined
     const latitudeRaw = String(req.query.lat ?? '').trim()
@@ -73,7 +73,7 @@ catalogRouter.get('/stores', async (req, res, next) => {
     const longitude = longitudeRaw ? Number(longitudeRaw) : null
 
     const stores = await prisma.store.findMany({
-      where: req.user!.role === 'CUSTOMER'
+      where: req.user?.role === 'CUSTOMER'
         ? { status: { in: ['draft', 'active', 'paused'] } }
         : { status: 'active', isOpen: true, acceptingOrders: true },
       include: {

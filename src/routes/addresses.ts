@@ -84,6 +84,18 @@ function resolveCoords(body: z.infer<typeof addressInput>) {
   return { latitude, longitude }
 }
 
+/** When the pin is inside Karachi metro, keep city usable for delivery-area matching. */
+function normalizeCityForPin(city: string, latitude: number | null, longitude: number | null) {
+  if (latitude == null || longitude == null) return city
+  const inKarachi = latitude >= 24.7 && latitude <= 25.2 && longitude >= 66.8 && longitude <= 67.4
+  if (!inKarachi) return city
+  const trimmed = city.trim()
+  if (!trimmed || trimmed.length < 3 || !/karachi/i.test(trimmed)) {
+    return 'Karachi'
+  }
+  return city
+}
+
 export const addressRouter = Router()
 addressRouter.use(requireAuth, requireRole('CUSTOMER'))
 
@@ -145,6 +157,8 @@ addressRouter.post('/', async (req, res, next) => {
     const landmark = body.landmark ?? ''
     const phone = body.phone ?? ''
     const deliveryInstructions = body.deliveryInstructions ?? ''
+    city = normalizeCityForPin(city, latitude, longitude)
+    if (city === 'Karachi' && !country.trim()) country = 'Pakistan'
 
     const composedLine =
       formatCustomerLine({
@@ -283,14 +297,16 @@ addressRouter.patch('/:id', async (req, res, next) => {
     const street = body.street !== undefined ? body.street : existing.street
     const subCity =
       body.area !== undefined ? body.area : body.subCity !== undefined ? body.subCity : existing.subCity
-    const city = body.city !== undefined ? body.city : existing.city
+    let city = body.city !== undefined ? body.city : existing.city
     const state = body.state !== undefined ? body.state : existing.state
-    const country = body.country !== undefined ? body.country : existing.country
+    let country = body.country !== undefined ? body.country : existing.country
     const postalCode = body.postalCode !== undefined ? body.postalCode : existing.postalCode
     const landmark = body.landmark !== undefined ? body.landmark : existing.landmark
     const phone = body.phone !== undefined ? body.phone : existing.phone
     const deliveryInstructions =
       body.deliveryInstructions !== undefined ? body.deliveryInstructions : existing.deliveryInstructions
+    city = normalizeCityForPin(city, latitude, longitude)
+    if (city === 'Karachi' && !String(country).trim()) country = 'Pakistan'
 
     const addressFieldsChanged =
       body.street !== undefined ||
