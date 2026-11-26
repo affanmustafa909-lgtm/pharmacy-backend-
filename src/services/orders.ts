@@ -1,5 +1,6 @@
 import type { ChargeRule, Prisma } from '@prisma/client'
-import { calculateCharges, type ChargeRuleInput } from '../domain/charges.js'
+import { calculateCharges, DeliveryRuleConfigurationError, type ChargeRuleInput } from '../domain/charges.js'
+import { getStoreOrderEligibility } from '../domain/storeAvailability.js'
 import { ENFORCE_OUT_OF_CITY_BLOCK, validateDeliveryCity } from '../domain/deliveryArea.js'
 import { isExpired } from '../lib/expiry.js'
 import { HttpError } from '../lib/http.js'
@@ -51,8 +52,13 @@ export async function quoteOrder(input: {
   if (!input.items?.length) throw new HttpError(400, 'Cart is empty', 'EMPTY_CART')
   const store = await prisma.store.findUnique({ where: { id: input.storeId } })
   if (!store) throw new HttpError(404, 'Store not found')
-  if (store.status !== 'active' || !store.isOpen || !store.acceptingOrders) {
-    throw new HttpError(400, 'This store is not accepting app orders right now')
+  const storeEligibility = getStoreOrderEligibility(store)
+  if (!storeEligibility.eligible) {
+    throw new HttpError(
+      400,
+      storeEligibility.reason ?? 'This store is not accepting app orders right now',
+      'STORE_NOT_ACCEPTING_ORDERS',
+    )
   }
 
 
@@ -208,12 +214,20 @@ export async function quoteOrder(input: {
   }
 
   const rules = await prisma.chargeRule.findMany({ where: { storeId: input.storeId, active: true } })
-  const charges = calculateCharges(
-    productSubtotal,
-    input.deliveryType,
-    rules.map(toRule),
-    deliveryDistanceKm,
-  )
+  let charges: ReturnType<typeof calculateCharges>
+  try {
+    charges = calculateCharges(
+      productSubtotal,
+      input.deliveryType,
+      rules.map(toRule),
+      deliveryDistanceKm,
+    )
+  } catch (error) {
+    if (error instanceof DeliveryRuleConfigurationError) {
+      throw new HttpError(400, error.message, 'DELIVERY_RULE_NOT_CONFIGURED')
+    }
+    throw error
+  }
   let discount = 0
   let promoLabel = ''
   if (input.promoCode?.trim()) {
@@ -288,7 +302,7 @@ export async function placeOrder(input: {
         where: { orderNumber: number, productId: line.product.id, reason: 'order_fulfillment' },
       })
       if (existingMove) continue
-      // Leave userId null for customer checkout — stock log is system/order driven, not a desk staff edit.
+      // Leave userId null for customer checkout â€” stock log is system/order driven, not a desk staff edit.
       await tx.stockMovement.create({
         data: {
           productId: line.product.id,
@@ -376,7 +390,7 @@ export async function placeOrder(input: {
     })
 
     // Pickup orders still surface on the pharmacy desk. Delivery orders notify
-    // only the assigned rider for that pharmacy — not a global broadcast.
+    // only the assigned rider for that pharmacy â€” not a global broadcast.
     if (input.deliveryType === 'pickup') {
       await tx.notice.create({
         data: {
@@ -405,7 +419,7 @@ export async function placeOrder(input: {
       userId: assignedRider.userId,
       type: 'order',
       title: 'New delivery order',
-      body: `${order.number} at ${order.store.name} — confirm, pick up the medicine, then deliver to the customer.`,
+      body: `${order.number} at ${order.store.name} â€” confirm, pick up the medicine, then deliver to the customer.`,
       data: {
         orderNumber: order.number,
         storeId: order.storeId,
@@ -573,7 +587,7 @@ export function mapOrderDetail(order: {
       : [
           { id: 'confirmed', title: 'Order placed', completed: completed >= 1 },
           { id: 'packed', title: 'Rider confirmed', completed: completed >= 2 },
-          { id: 'on_way', title: 'Picked up · On the way', completed: completed >= 3 },
+          { id: 'on_way', title: 'Picked up Â· On the way', completed: completed >= 3 },
           { id: 'delivered', title: 'Delivered', completed: completed >= 4 },
         ],
   }
@@ -588,11 +602,12 @@ export function receiptHtml(detail: ReturnType<typeof mapOrderDetail>) {
     .join('')
   return `<!doctype html><html><head><meta charset="utf-8"><title>Receipt ${detail.id}</title>
   <style>body{font-family:Georgia,serif;color:#131315;padding:24px}table{width:100%;border-collapse:collapse;margin:16px 0}td,th{border-bottom:1px solid #e5e5e5;padding:8px;text-align:left}.muted{color:#8a8a8e}</style></head>
-  <body><h1>Hera Pharmacy</h1><p class="muted">${detail.id} · ${new Date(detail.createdAt).toLocaleString()}</p>
+  <body><h1>Hera Pharmacy</h1><p class="muted">${detail.id} Â· ${new Date(detail.createdAt).toLocaleString()}</p>
   <p>${detail.storeName}<br/>${detail.storeAddress}</p>
   <table><thead><tr><th>Product</th><th>Qty</th><th>Price</th><th>Total</th></tr></thead><tbody>${rows}</tbody></table>
   <p>Products: $${detail.productSubtotal.toFixed(2)}<br/>Delivery: $${detail.deliveryCharge.toFixed(2)}<br/>Service: $${detail.serviceCharge.toFixed(2)}<br/>BFP: $${detail.bfpCharge.toFixed(2)}<br/>Discount: $${detail.discount.toFixed(2)}<br/><strong>Total: $${detail.total.toFixed(2)}</strong></p>
-  <p class="muted">${detail.deliveryType} · ${detail.paymentLabel}</p></body></html>`
+  <p class="muted">${detail.deliveryType} Â· ${detail.paymentLabel}</p></body></html>`
 }
 
 export type Tx = Prisma.TransactionClient
+

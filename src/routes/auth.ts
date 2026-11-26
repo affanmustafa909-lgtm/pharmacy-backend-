@@ -1,4 +1,4 @@
-import { Router } from 'express'
+﻿import { Router } from 'express'
 import fs from 'node:fs'
 import path from 'node:path'
 import multer from 'multer'
@@ -259,15 +259,28 @@ authRouter.post('/register', async (req, res, next) => {
 
 authRouter.post('/login', async (req, res, next) => {
   try {
-    const body = z.object({ email: z.string().email(), password: z.string().min(6) }).parse(req.body)
+    const body = z.object({
+      email: z.string().email(),
+      password: z.string().min(6),
+    }).parse(req.body)
+
     limit(body.email.toLowerCase())
-    const user = await prisma.user.findUnique({ where: { email: body.email.toLowerCase() } })
+
+    const user = await prisma.user.findUnique({
+      where: { email: body.email.toLowerCase() },
+    })
+
     if (!user || !(await checkPassword(body.password, user.passwordHash))) {
       throw new HttpError(401, 'Email or password is incorrect')
     }
+
     if (user.role === 'RIDER') {
-      const rider = await prisma.rider.findFirst({ where: { userId: user.id } })
+      const rider = await prisma.rider.findFirst({
+        where: { userId: user.id },
+      })
+
       if (!rider) throw new HttpError(403, 'No rider profile found for this account')
+
       if (rider.approvalStatus === 'pending') {
         throw new HttpError(
           403,
@@ -275,6 +288,7 @@ authRouter.post('/login', async (req, res, next) => {
           'RIDER_PENDING',
         )
       }
+
       if (rider.approvalStatus === 'rejected') {
         throw new HttpError(
           403,
@@ -284,24 +298,33 @@ authRouter.post('/login', async (req, res, next) => {
           'RIDER_REJECTED',
         )
       }
+
       if (!rider.active || !rider.storeId) {
         throw new HttpError(403, 'Your rider account is not assigned to a pharmacy yet')
       }
     }
+
     if (user.role === 'CUSTOMER') {
       await writeAudit({
         actorId: user.id,
         action: 'customer.login',
         detail: 'Customer signed in',
-        meta: { source: 'mobile_app' },
-      }).catch(() => undefined)
+        meta: {
+          source: 'mobile_app',
+          customerId: user.id,
+        },
+      })
     }
+
     res.json(await buildUserPayload(user))
   } catch (error) {
-    next(error instanceof z.ZodError ? new HttpError(400, 'Enter a valid email and password') : error)
+    next(
+      error instanceof z.ZodError
+        ? new HttpError(400, 'Enter a valid email and password')
+        : error,
+    )
   }
 })
-
 /** Reconnects the mobile demo app to the primary saved customer account even if its email was edited. */
 authRouter.post('/customer-bootstrap', async (_req, res, next) => {
   try {
@@ -316,6 +339,60 @@ authRouter.post('/customer-bootstrap', async (_req, res, next) => {
   }
 })
 
+authRouter.post('/store-context', requireAuth, async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'CUSTOMER') {
+      throw new HttpError(403, 'Customer account required')
+    }
+
+    const body = z.object({
+      storeId: z.string().trim().min(1),
+    }).parse(req.body)
+
+    const store = await prisma.store.findFirst({
+      where: {
+        id: body.storeId,
+        status: 'active',
+      },
+      select: {
+        id: true,
+        code: true,
+        name: true,
+        city: true,
+      },
+    })
+
+    if (!store) {
+      throw new HttpError(404, 'Selected pharmacy is not available')
+    }
+
+    await writeAudit({
+      actorId: req.user!.id,
+      storeId: store.id,
+      action: 'customer.store_selected',
+      detail: `Selected pharmacy: ${store.name}`,
+      meta: {
+        source: 'mobile_app',
+        customerId: req.user!.id,
+        storeCode: store.code,
+        storeName: store.name,
+        city: store.city,
+      },
+    })
+
+    res.json({
+      success: true,
+      customerId: req.user!.id,
+      store,
+    })
+  } catch (error) {
+    next(
+      error instanceof z.ZodError
+        ? new HttpError(400, 'A valid store ID is required')
+        : error,
+    )
+  }
+})
 authRouter.get('/me', requireAuth, async (req, res, next) => {
   try {
     const user = await prisma.user.findUnique({ where: { id: req.user!.id } })
@@ -511,4 +588,5 @@ authRouter.post(
     }
   },
 )
+
 

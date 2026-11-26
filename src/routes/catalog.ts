@@ -7,6 +7,7 @@ import { requireAuth, requireRole } from '../middleware/auth.js'
 import { isSellable, mapCatalogProduct } from '../services/catalogMap.js'
 import { DEFAULT_MAX_DELIVERY_DISTANCE_KM, resolveStoreCity } from '../domain/deliveryArea.js'
 import { filterStoresAvailableToCustomer } from '../services/availableStores.js'
+import { getStoreOrderEligibility } from '../domain/storeAvailability.js'
 import { money } from '../services/money.js'
 import { normalizeMobileConfig } from '../services/mobileConfig.js'
 import { sellableStock } from '../services/inventory.js'
@@ -74,11 +75,9 @@ catalogRouter.get('/stores', async (req, res, next) => {
     const longitude = longitudeRaw ? Number(longitudeRaw) : null
 
     const stores = await prisma.store.findMany({
-      where: {
-        status: 'active',
-        isOpen: true,
-        acceptingOrders: true,
-      },
+      where: req.user!.role === 'CUSTOMER'
+        ? { status: { in: ['draft', 'active', 'paused'] } }
+        : { status: 'active', isOpen: true, acceptingOrders: true },
       include: {
         chargeRules: {
           where: { kind: 'DELIVERY', active: true },
@@ -117,6 +116,8 @@ catalogRouter.get('/stores', async (req, res, next) => {
         mapLng: store.mapLng,
         deliveryDistanceKm: store.deliveryDistanceKm,
         available: store.available,
+        orderEligible: getStoreOrderEligibility(stores.find((candidate) => candidate.id === store.id)!).eligible,
+        orderEligibilityReason: getStoreOrderEligibility(stores.find((candidate) => candidate.id === store.id)!).reason,
         deliveryRules: store.chargeRules.map((rule) => ({
           id: rule.id,
           label: rule.label,

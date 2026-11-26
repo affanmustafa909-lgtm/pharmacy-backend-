@@ -22,6 +22,7 @@ import {
 } from '../services/permissions.js'
 import { recordStockMovement } from '../services/inventory.js'
 import { buildSnapshot } from '../services/snapshot.js'
+import { normalizeMobileConfig } from '../services/mobileConfig.js'
 
 const uploadDir = path.resolve('uploads/products')
 fs.mkdirSync(uploadDir, { recursive: true })
@@ -1092,7 +1093,7 @@ adminRouter.post('/orders/:number/status', async (req, res, next) => {
     await prisma.orderActivity.create({
       data: {
         orderId: order.id,
-        label: `Status → ${body.status.replaceAll('_', ' ')}`,
+        label: `Status â†’ ${body.status.replaceAll('_', ' ')}`,
         detail: body.cancelReason || body.refundReason || '',
         actor: req.user!.name,
       },
@@ -1280,7 +1281,7 @@ adminRouter.post('/prescriptions/:number/decision', async (req, res, next) => {
       actorId: req.user!.id,
       storeId: prescription.storeId,
       action: 'prescription.review',
-      detail: `${updated.number} → ${body.status}`,
+      detail: `${updated.number} â†’ ${body.status}`,
       meta: { verifiedCount: enrichedItems.length },
     })
 
@@ -1697,6 +1698,16 @@ adminRouter.get('/customers/:id/activities', async (req, res, next) => {
         action: true,
         detail: true,
         createdAt: true,
+        storeId: true,
+        meta: true,
+        store: {
+          select: {
+            id: true,
+            code: true,
+            name: true,
+            city: true,
+          },
+        },
       },
     })
 
@@ -1761,5 +1772,306 @@ adminRouter.patch('/customers/:id', async (req, res, next) => {
     })
   } catch (error) {
     next(zodFail(error))
+  }
+})
+
+
+/* Admin-managed customer reminders */
+adminRouter.post('/reminders', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'ADMIN') {
+      throw new HttpError(403, 'Only an administrator can create customer reminders')
+    }
+
+    const body = z.object({
+      customerId: z.string().trim().min(1),
+      medicine: z.string().trim().min(1).max(120),
+      time: z.string().trim().min(1).max(40),
+      frequency: z.string().trim().min(1).max(80),
+    }).parse(req.body)
+
+    const customer = await prisma.user.findFirst({
+      where: { id: body.customerId, role: 'CUSTOMER' },
+      select: { id: true, name: true },
+    })
+
+    if (!customer) {
+      throw new HttpError(404, 'Selected customer was not found')
+    }
+
+    const reminder = await prisma.reminder.create({
+      data: {
+        customerId: customer.id,
+        customerName: customer.name,
+        medicine: body.medicine,
+        time: body.time,
+        frequency: body.frequency,
+        enabled: true,
+      },
+    })
+
+    await notifyCustomer({
+      customerId: customer.id,
+      type: 'refill',
+      title: 'New medicine reminder',
+      body: `A reminder for ${reminder.medicine} has been added to your Hera account.`,
+      data: { reminderId: reminder.id },
+    })
+
+    await writeAudit({
+      actorId: req.user!.id,
+      action: 'customer.reminder_created',
+      detail: `Created a ${reminder.medicine} reminder for ${customer.name}`,
+      meta: { customerId: customer.id, reminderId: reminder.id },
+    })
+
+    res.status(201).json({ reminder })
+  } catch (error) {
+    next(zodFail(error))
+  }
+})
+
+adminRouter.post('/reminders/:id/toggle', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'ADMIN') {
+      throw new HttpError(403, 'Only an administrator can manage customer reminders')
+    }
+
+    const existing = await prisma.reminder.findUnique({
+      where: { id: req.params.id },
+    })
+
+    if (!existing) {
+      throw new HttpError(404, 'Reminder not found')
+    }
+
+    const updated = await prisma.reminder.update({
+      where: { id: existing.id },
+      data: {
+        enabled: !existing.enabled,
+        snoozedUntil: null,
+      },
+    })
+
+    await writeAudit({
+      actorId: req.user!.id,
+      action: 'customer.reminder_updated',
+      detail: `${updated.enabled ? 'Enabled' : 'Disabled'} reminder ${updated.medicine}`,
+      meta: { reminderId: updated.id, customerId: updated.customerId },
+    })
+
+    res.json({ id: updated.id, enabled: updated.enabled })
+  } catch (error) {
+    next(error)
+  }
+})
+
+adminRouter.delete('/reminders/:id', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'ADMIN') {
+      throw new HttpError(403, 'Only an administrator can delete customer reminders')
+    }
+
+    const existing = await prisma.reminder.findUnique({
+      where: { id: req.params.id },
+    })
+
+    if (!existing) {
+      throw new HttpError(404, 'Reminder not found')
+    }
+
+    await prisma.reminder.delete({
+      where: { id: existing.id },
+    })
+
+    await writeAudit({
+      actorId: req.user!.id,
+      action: 'customer.reminder_deleted',
+      detail: `Deleted reminder ${existing.medicine} for ${existing.customerName}`,
+      meta: { reminderId: existing.id, customerId: existing.customerId },
+    })
+
+    res.status(204).end()
+  } catch (error) {
+    next(error)
+  }
+})
+
+/* Admin mobile app configuration */
+adminRouter.put('/mobile-config', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'ADMIN') {
+      throw new HttpError(403, 'Only an administrator can update mobile app content')
+    }
+
+    const body = z.object({ config: z.unknown() }).parse(req.body)
+
+    if (!body.config || typeof body.config !== 'object' || Array.isArray(body.config)) {
+      throw new HttpError(400, 'A valid mobile configuration object is required')
+    }
+
+    const existing = await prisma.setting.findUnique({
+      where: { id: 'default' },
+      select: { mobileConfig: true },
+    })
+
+    const currentConfig = normalizeMobileConfig(existing?.mobileConfig)
+    const incoming = body.config as Record<string, unknown>
+
+    const incomingTracking =
+      incoming.tracking && typeof incoming.tracking === 'object' && !Array.isArray(incoming.tracking)
+        ? incoming.tracking as Record<string, unknown>
+        : {}
+
+    const mergedConfig = normalizeMobileConfig({
+      ...currentConfig,
+      ...incoming,
+      tracking: {
+        ...currentConfig.tracking,
+        ...incomingTracking,
+      },
+    })
+
+    const setting = await prisma.setting.upsert({
+      where: { id: 'default' },
+      update: { mobileConfig: mergedConfig as Prisma.InputJsonValue },
+      create: { id: 'default', mobileConfig: mergedConfig as Prisma.InputJsonValue },
+      select: { mobileConfig: true },
+    })
+
+    await writeAudit({
+      actorId: req.user!.id,
+      action: 'mobile.config_updated',
+      detail: 'Updated mobile application content',
+    })
+
+    res.json({ config: normalizeMobileConfig(setting.mobileConfig) })
+  } catch (error) {
+    next(zodFail(error))
+  }
+})
+
+/* Admin promo code management: discount is a fixed monetary amount */
+adminRouter.post('/promos', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'ADMIN') {
+      throw new HttpError(403, 'Only an administrator can create promo codes')
+    }
+
+    const body = z.object({
+      code: z.string().trim().min(1).max(40),
+      label: z.string().trim().min(1).max(120),
+      discount: z.number().finite().nonnegative(),
+    }).parse(req.body)
+
+    const code = body.code.toUpperCase()
+
+    const existing = await prisma.promoCode.findUnique({
+      where: { code },
+      select: { id: true },
+    })
+
+    if (existing) {
+      throw new HttpError(409, 'This promo code already exists')
+    }
+
+    const promo = await prisma.promoCode.create({
+      data: {
+        code,
+        label: body.label,
+        discount: dec(body.discount),
+        active: true,
+      },
+    })
+
+    await writeAudit({
+      actorId: req.user!.id,
+      action: 'promo.created',
+      detail: `Created promo code ${promo.code}`,
+      meta: { promoId: promo.id, discount: body.discount },
+    })
+
+    res.status(201).json({
+      promo: {
+        id: promo.id,
+        code: promo.code,
+        label: promo.label,
+        discount: money(promo.discount),
+        active: promo.active,
+      },
+    })
+  } catch (error) {
+    next(zodFail(error))
+  }
+})
+
+adminRouter.patch('/promos/:id', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'ADMIN') {
+      throw new HttpError(403, 'Only an administrator can update promo codes')
+    }
+
+    const body = z.object({
+      active: z.boolean(),
+    }).parse(req.body)
+
+    const existing = await prisma.promoCode.findUnique({
+      where: { id: req.params.id },
+    })
+
+    if (!existing) {
+      throw new HttpError(404, 'Promo code not found')
+    }
+
+    const promo = await prisma.promoCode.update({
+      where: { id: existing.id },
+      data: { active: body.active },
+    })
+
+    await writeAudit({
+      actorId: req.user!.id,
+      action: 'promo.status_updated',
+      detail: `${promo.active ? 'Activated' : 'Deactivated'} promo code ${promo.code}`,
+      meta: { promoId: promo.id, active: promo.active },
+    })
+
+    res.json({
+      id: promo.id,
+      code: promo.code,
+      active: promo.active,
+    })
+  } catch (error) {
+    next(zodFail(error))
+  }
+})
+
+adminRouter.delete('/promos/:id', async (req, res, next) => {
+  try {
+    if (req.user!.role !== 'ADMIN') {
+      throw new HttpError(403, 'Only an administrator can delete promo codes')
+    }
+
+    const existing = await prisma.promoCode.findUnique({
+      where: { id: req.params.id },
+    })
+
+    if (!existing) {
+      throw new HttpError(404, 'Promo code not found')
+    }
+
+    await prisma.promoCode.delete({
+      where: { id: existing.id },
+    })
+
+    await writeAudit({
+      actorId: req.user!.id,
+      action: 'promo.deleted',
+      detail: `Deleted promo code ${existing.code}`,
+      meta: { promoId: existing.id },
+    })
+
+    res.status(204).end()
+  } catch (error) {
+    next(error)
   }
 })
