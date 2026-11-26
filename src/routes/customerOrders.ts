@@ -1,12 +1,27 @@
 import { Router } from 'express'
+import type { Prisma } from '@prisma/client'
 import { z } from 'zod'
-import { HttpError } from '../lib/http.js'
 import { isExpired } from '../lib/expiry.js'
+import { HttpError } from '../lib/http.js'
 import { prisma } from '../lib/prisma.js'
 import { requireAuth, requireRole } from '../middleware/auth.js'
+import {
+  assertDeliveryAddress,
+  deliveryAddressSchema,
+  pickupContactSchema,
+} from '../services/deliveryAddress.js'
 import { money } from '../services/money.js'
 import { listOrderMessages, postOrderMessage } from '../services/orderMessages.js'
-import { mapOrderDetail, placeOrder, quoteOrder, receiptHtml, recheckBuyAgain } from '../services/orders.js'
+import {
+  mapOrderDetail,
+  placeMultiStoreCheckout,
+  placeOrder,
+  planCheckoutSplit,
+  quoteOrder,
+  receiptHtml,
+  recheckBuyAgain,
+} from '../services/orders.js'
+import { findNearbyStores } from '../services/nearbyStores.js'
 
 const itemsSchema = z
   .array(z.object({ productId: z.string().min(1), quantity: z.number().int().positive() }))
@@ -24,7 +39,25 @@ const quoteSchema = z.object({
 
 const placeSchema = quoteSchema.extend({
   paymentLabel: z.string().min(1).max(80),
+  paymentStatus: z.enum(['paid', 'unpaid']).optional(),
   addressLine: z.string().max(240).default(''),
+})
+
+const checkoutSchema = z.object({
+  deliveryType: z.enum(['standard', 'express', 'pickup']),
+  paymentLabel: z.string().min(1).max(80),
+  paymentStatus: z.enum(['paid', 'unpaid']).optional(),
+  items: itemsSchema,
+  idempotencyKey: z.string().trim().min(8).max(120),
+  confirmSplit: z.boolean().optional(),
+  promoCode: z.string().trim().max(40).optional(),
+  prescriptionNumber: z.string().trim().max(40).optional(),
+  addressId: z.string().min(1).optional(),
+  address: deliveryAddressSchema.partial().optional(),
+  pickupContact: pickupContactSchema.optional(),
+  recipientName: z.string().trim().max(80).optional(),
+  recipientPhone: z.string().trim().max(40).optional(),
+  addressLine: z.string().trim().max(240).optional(),
 })
 
 export const customerOrderRouter = Router()
@@ -57,6 +90,162 @@ customerOrderRouter.post('/quote', async (req, res, next) => {
     })
   } catch (error) {
     next(error instanceof z.ZodError ? new HttpError(400, error.issues[0]?.message || 'Check the order details') : error)
+  }
+})
+
+customerOrderRouter.post('/nearby-stores', async (req, res, next) => {
+  try {
+    const body = z
+      .object({
+        address: deliveryAddressSchema.partial().extend({
+          city: z.string().trim().min(1).optional(),
+          area: z.string().trim().min(1).optional(),
+          line: z.string().trim().min(1).optional(),
+        }),
+        deliveryType: z.enum(['standard', 'express', 'pickup']).optional(),
+        skus: z
+          .array(z.object({ sku: z.string().min(1), quantity: z.number().int().positive() }))
+          .max(40)
+          .optional(),
+      })
+      .parse(req.body)
+    const result = await findNearbyStores({
+      address: body.address,
+      deliveryType: body.deliveryType,
+      skus: body.skus,
+    })
+    res.json(result)
+  } catch (error) {
+    next(error instanceof z.ZodError ? new HttpError(400, error.issues[0]?.message || 'Check the address') : error)
+  }
+})
+
+customerOrderRouter.post('/plan', async (req, res, next) => {
+  try {
+    const body = z
+      .object({
+        deliveryType: z.enum(['standard', 'express', 'pickup']),
+        items: itemsSchema,
+        promoCode: z.string().trim().max(40).optional(),
+        prescriptionNumber: z.string().trim().max(40).optional(),
+        addressId: z.string().min(1).optional(),
+      })
+      .parse(req.body)
+    const plan = await planCheckoutSplit({
+      customerId: req.user!.id,
+      ...body,
+    })
+    res.json(plan)
+  } catch (error) {
+    next(error instanceof z.ZodError ? new HttpError(400, error.issues[0]?.message || 'Check the order details') : error)
+  }
+})
+
+customerOrderRouter.post('/checkout', async (req, res, next) => {
+  try {
+    const body = checkoutSchema.parse(req.body)
+    let recipientName = body.recipientName ?? ''
+    let recipientPhone = body.recipientPhone ?? ''
+    let addressLine = body.addressLine ?? ''
+    let addressJson: Prisma.InputJsonValue | undefined
+
+    if (body.deliveryType === 'pickup') {
+      const contact = pickupContactSchema.parse(
+        body.pickupContact ?? {
+          recipientName: body.recipientName,
+          phone: body.recipientPhone,
+        },
+      )
+      recipientName = contact.recipientName
+      recipientPhone = contact.phone
+      addressLine = ''
+    } else {
+      const raw = (body.address ?? {}) as Record<string, unknown>
+      const lineParts = String(body.addressLine ?? raw.line ?? '')
+        .split(',')
+        .map((part) => part.trim())
+        .filter(Boolean)
+      const textOr = (value: unknown, fallback: string, min = 2) => {
+        const text = String(value ?? '').trim()
+        return text.length >= min ? text : fallback
+      }
+      let cityGuess = lineParts.length >= 2 ? lineParts[lineParts.length - 1] : 'City'
+      if (/^[A-Z]{2}$/i.test(cityGuess) && lineParts.length >= 3) {
+        cityGuess = lineParts[lineParts.length - 2]
+      } else {
+        cityGuess = cityGuess.replace(/\s+[A-Z]{2}$/i, '').trim() || cityGuess
+      }
+      const address = assertDeliveryAddress(
+        deliveryAddressSchema.parse({
+          label: textOr(raw.label, 'Home', 1),
+          recipientName: textOr(raw.recipientName, textOr(body.recipientName, 'Customer')),
+          phone: textOr(raw.phone, textOr(body.recipientPhone, '+10000000000', 8), 8),
+          houseNo: textOr(raw.houseNo, 'N/A', 1),
+          street: textOr(raw.street, lineParts[0] || body.addressLine || 'Address'),
+          area: textOr(raw.area, 'Local area'),
+          city: textOr(raw.city, cityGuess),
+          landmark: String(raw.landmark ?? '').trim(),
+          deliveryInstructions: String(raw.deliveryInstructions ?? '').trim(),
+          lat: typeof raw.lat === 'number' ? raw.lat : null,
+          lng: typeof raw.lng === 'number' ? raw.lng : null,
+          isDefault: Boolean(raw.isDefault),
+        }),
+      )
+      recipientName = address.recipientName
+      recipientPhone = address.phone
+      addressLine = address.line
+      addressJson = address
+    }
+
+    const result = await placeMultiStoreCheckout({
+      customerId: req.user!.id,
+      customerEmail: req.user!.email,
+      idempotencyKey: body.idempotencyKey,
+      deliveryType: body.deliveryType,
+      paymentLabel: body.paymentLabel,
+      paymentStatus: body.paymentStatus,
+      recipientName,
+      recipientPhone,
+      addressLine,
+      addressId: body.addressId,
+      addressJson,
+      items: body.items,
+      promoCode: body.promoCode,
+      prescriptionNumber: body.prescriptionNumber,
+      confirmSplit: body.confirmSplit,
+    })
+
+    res.status(result.reused ? 200 : 201).json({
+      checkoutGroupId: result.checkoutGroupId,
+      combinedTotal: result.combinedTotal,
+      reused: result.reused,
+      orders: result.orders.map((order) => ({
+        id: order.number,
+        storeId: order.storeId,
+        storeName: order.store.name,
+        total: money(order.total),
+        productSubtotal: money(order.productSubtotal),
+        deliveryCharge: money(order.deliveryCharge),
+        serviceCharge: money(order.serviceCharge),
+        bfpCharge: money(order.bfpCharge),
+        discount: money(order.discount),
+        paymentStatus: order.paymentStatus,
+        paymentLabel: order.paymentLabel,
+        itemCount: order.items.reduce((sum, item) => sum + item.quantity, 0),
+        deliveryType: order.deliveryType,
+        recipientName: order.recipientName,
+        recipientPhone: order.recipientPhone,
+        addressLine: order.addressLine,
+        riderName: order.rider?.name ?? null,
+        riderPhone: order.rider?.phone ?? null,
+      })),
+    })
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      next(new HttpError(400, error.issues[0]?.message || 'Check the order details'))
+      return
+    }
+    next(error)
   }
 })
 
@@ -123,6 +312,8 @@ customerOrderRouter.get('/mine', async (req, res) => {
       id: order.number,
       total: money(order.total),
       status: order.status,
+      paymentStatus: order.paymentStatus,
+      checkoutGroupId: order.checkoutGroupId,
       storeName: order.store.name,
       deliveryType: order.deliveryType,
       paymentLabel: order.paymentLabel,
@@ -274,12 +465,42 @@ customerOrderRouter.get('/:number/receipt', async (req, res, next) => {
     })
     if (!order) throw new HttpError(404, 'Order not found')
     const detail = mapOrderDetail(order)
+    let related: ReturnType<typeof mapOrderDetail>[] = []
+    if (order.checkoutGroupId) {
+      const siblings = await prisma.order.findMany({
+        where: {
+          checkoutGroupId: order.checkoutGroupId,
+          customerId: req.user!.id,
+          NOT: { id: order.id },
+        },
+        include: { items: true, charges: true, store: true, rider: true },
+        orderBy: { createdAt: 'asc' },
+      })
+      related = siblings.map(mapOrderDetail)
+    }
+    const html = receiptHtml(detail, related)
     const format = String(req.query.format ?? 'json')
     if (format === 'html') {
-      res.type('html').send(receiptHtml(detail))
+      res.type('html').send(html)
       return
     }
-    res.json({ ...detail, html: receiptHtml(detail) })
+    const all = [detail, ...related]
+    res.json({
+      ...detail,
+      relatedOrders: related,
+      combinedTotal: Math.round(all.reduce((sum, row) => sum + row.total, 0) * 100) / 100,
+      html,
+      text: [
+        `Hera Pharmacy receipt`,
+        ...all.flatMap((row) => [
+          `${row.id} · ${row.storeName}`,
+          ...row.items.map((item) => `  ${item.name} ×${item.quantity} · $${item.lineTotal.toFixed(2)}`),
+          `  Products $${row.productSubtotal.toFixed(2)} · Delivery $${row.deliveryCharge.toFixed(2)} · Service $${row.serviceCharge.toFixed(2)} · BFP $${row.bfpCharge.toFixed(2)}`,
+          `  Store total $${row.total.toFixed(2)} · Payment ${row.paymentStatus}`,
+        ]),
+        `Final total $${all.reduce((sum, row) => sum + row.total, 0).toFixed(2)}`,
+      ].join('\n'),
+    })
   } catch (error) {
     next(error)
   }
@@ -289,7 +510,13 @@ customerOrderRouter.get('/:number', async (req, res, next) => {
   try {
     const order = await prisma.order.findFirst({
       where: { number: req.params.number, customerId: req.user!.id },
-      include: { items: true, charges: true, store: true, rider: true },
+      include: {
+        items: true,
+        charges: true,
+        store: true,
+        rider: true,
+        activities: { orderBy: { createdAt: 'asc' } },
+      },
     })
     if (!order) throw new HttpError(404, 'Order not found')
     res.json(mapOrderDetail(order))

@@ -9,6 +9,7 @@ import { authRouter } from './routes/auth.js'
 import { addressRouter } from './routes/addresses.js'
 import { catalogRouter } from './routes/catalog.js'
 import { customerOrderRouter } from './routes/customerOrders.js'
+import { favoritesRouter } from './routes/favorites.js'
 import { importRouter } from './routes/import.js'
 import { notificationRouter } from './routes/notifications.js'
 import { prescriptionRouter } from './routes/prescriptions.js'
@@ -31,6 +32,7 @@ export function createApp() {
   app.use('/orders', customerOrderRouter)
   app.use('/admin/orders', adminOrderRouter)
   app.use('/addresses', addressRouter)
+  app.use('/favorites', favoritesRouter)
   app.use('/reminders', reminderRouter)
   app.use('/prescriptions', prescriptionRouter)
   app.use('/notifications', notificationRouter)

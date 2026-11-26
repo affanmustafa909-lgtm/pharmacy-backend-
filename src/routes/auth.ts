@@ -1,4 +1,5 @@
 import { Router } from 'express'
+import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import multer from 'multer'
@@ -127,6 +128,7 @@ async function buildUserPayload(user: {
       gender: user.gender,
       allergies: user.allergies,
       profilePhoto: user.profilePhoto,
+      role: user.role,
       storeId: primaryStoreId,
       deskRole: user.role === 'ADMIN' ? 'OWNER' : user.deskRole,
       assignedStoreIds,
@@ -139,7 +141,7 @@ async function buildUserPayload(user: {
 const registerSchema = z.object({
   name: z.string().trim().min(1, 'Full name is required').max(100),
   email: z.string().trim().email('Enter a valid email address').max(160),
-  password: z.string().min(6, 'Password must be at least 6 characters').max(120),
+  password: z.string().min(8, 'Password must be at least 8 characters').max(120),
   phone: z.string().trim().max(40).optional(),
   city: z.string().trim().max(80).optional(),
   dateOfBirth: z.string().trim().max(30).optional(),
@@ -257,13 +259,142 @@ authRouter.post('/register', async (req, res, next) => {
   }
 })
 
+authRouter.post('/forgot-password', async (req, res, next) => {
+  try {
+    const body = z.object({ email: z.string().email() }).parse(req.body)
+    const email = body.email.toLowerCase()
+    limit(`forgot:${email}`)
+    const message = 'If an account exists for that email, a one-time reset code has been sent.'
+    const user = await prisma.user.findUnique({ where: { email } })
+    if (!user || user.role !== 'CUSTOMER') {
+      res.json({ ok: true, message })
+      return
+    }
+
+    const code = String(crypto.randomInt(100000, 999999))
+    const passwordResetToken = await hashPassword(code)
+    const passwordResetExpires = new Date(Date.now() + 15 * 60 * 1000)
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { passwordResetToken, passwordResetExpires },
+    })
+
+    // No SMTP in local/dev — log the OTP and return it outside production for QA.
+    console.info(`[password-reset] ${email} code=${code} expires=${passwordResetExpires.toISOString()}`)
+    const payload: { ok: true; message: string; expiresInMinutes: number; devCode?: string } = {
+      ok: true,
+      message,
+      expiresInMinutes: 15,
+    }
+    if (process.env.NODE_ENV !== 'production') {
+      payload.devCode = code
+    }
+    res.json(payload)
+  } catch (error) {
+    next(error instanceof z.ZodError ? new HttpError(400, 'Enter a valid email address') : error)
+  }
+})
+
+authRouter.post('/reset-password', async (req, res, next) => {
+  try {
+    const body = z
+      .object({
+        email: z.string().email(),
+        code: z.string().trim().min(4).max(12),
+        password: z.string().min(8, 'Password must be at least 8 characters').max(120),
+      })
+      .parse(req.body)
+    const email = body.email.toLowerCase()
+    limit(`reset:${email}`)
+    const user = await prisma.user.findUnique({ where: { email } })
+    if (
+      !user ||
+      user.role !== 'CUSTOMER' ||
+      !user.passwordResetToken ||
+      !user.passwordResetExpires ||
+      user.passwordResetExpires.getTime() < Date.now()
+    ) {
+      throw new HttpError(400, 'Reset code is invalid or expired')
+    }
+    const valid = await checkPassword(body.code, user.passwordResetToken)
+    if (!valid) throw new HttpError(400, 'Reset code is invalid or expired')
+
+    const passwordHash = await hashPassword(body.password)
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        passwordHash,
+        passwordResetToken: null,
+        passwordResetExpires: null,
+      },
+    })
+    await writeAudit({
+      actorId: user.id,
+      action: 'customer.password_reset',
+      detail: 'Customer reset their password',
+      meta: { source: 'mobile_app' },
+    }).catch(() => undefined)
+
+    res.json({ ok: true, message: 'Password updated. You can sign in now.' })
+  } catch (error) {
+    next(
+      error instanceof z.ZodError
+        ? new HttpError(400, error.issues[0]?.message || 'Check your reset details')
+        : error,
+    )
+  }
+})
+
+authRouter.post('/change-password', requireAuth, async (req, res, next) => {
+  try {
+    const body = z
+      .object({
+        currentPassword: z.string().min(1, 'Current password is required'),
+        newPassword: z.string().min(8, 'Password must be at least 8 characters').max(120),
+      })
+      .parse(req.body)
+    const user = await prisma.user.findUnique({ where: { id: req.user!.id } })
+    if (!user || user.role !== 'CUSTOMER') {
+      throw new HttpError(403, 'Only customers can change password here')
+    }
+    if (!(await checkPassword(body.currentPassword, user.passwordHash))) {
+      throw new HttpError(401, 'Current password is incorrect', 'INVALID_CREDENTIALS')
+    }
+    const passwordHash = await hashPassword(body.newPassword)
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        passwordHash,
+        passwordResetToken: null,
+        passwordResetExpires: null,
+      },
+    })
+    await writeAudit({
+      actorId: user.id,
+      action: 'customer.password_change',
+      detail: 'Customer changed their password',
+      meta: { source: 'mobile_app' },
+    }).catch(() => undefined)
+    res.json({ ok: true, message: 'Password updated.' })
+  } catch (error) {
+    next(
+      error instanceof z.ZodError
+        ? new HttpError(400, error.issues[0]?.message || 'Check your password details')
+        : error,
+    )
+  }
+})
+
 authRouter.post('/login', async (req, res, next) => {
   try {
     const body = z.object({ email: z.string().email(), password: z.string().min(6) }).parse(req.body)
     limit(body.email.toLowerCase())
     const user = await prisma.user.findUnique({ where: { email: body.email.toLowerCase() } })
-    if (!user || !(await checkPassword(body.password, user.passwordHash))) {
-      throw new HttpError(401, 'Email or password is incorrect')
+    if (!user) {
+      throw new HttpError(401, 'No account found. Please sign up first.', 'USER_NOT_FOUND')
+    }
+    if (!(await checkPassword(body.password, user.passwordHash))) {
+      throw new HttpError(401, 'Email or password is incorrect', 'INVALID_CREDENTIALS')
     }
     if (user.role === 'RIDER') {
       const rider = await prisma.rider.findFirst({ where: { userId: user.id } })

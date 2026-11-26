@@ -42,7 +42,13 @@ interface NominatimItem {
 const NOMINATIM_BASE = (process.env.GEOCODER_BASE_URL || 'https://nominatim.openstreetmap.org').replace(/\/+$/, '')
 const HEADERS = {
   Accept: 'application/json',
+  'Accept-Language': 'en',
   'User-Agent': 'HeraPharmacyApp/1.0 (delivery-geocoder)',
+}
+
+function nominatimUrl(pathAndQuery: string) {
+  const joiner = pathAndQuery.includes('?') ? '&' : '?'
+  return `${NOMINATIM_BASE}${pathAndQuery}${joiner}accept-language=en`
 }
 
 function mapNominatim(item: NominatimItem): GeocodedPlace | null {
@@ -107,7 +113,9 @@ export async function searchPlaces(query: string, limit = 6): Promise<GeocodedPl
   const q = query.trim()
   if (q.length < 2) return []
 
-  const url = `${NOMINATIM_BASE}/search?format=jsonv2&addressdetails=1&limit=${Math.min(limit, 10)}&q=${encodeURIComponent(q)}`
+  const url = nominatimUrl(
+    `/search?format=jsonv2&addressdetails=1&limit=${Math.min(limit, 10)}&q=${encodeURIComponent(q)}`,
+  )
   try {
     const response = await fetch(url, {
       signal: AbortSignal.timeout(7000),
@@ -123,7 +131,9 @@ export async function searchPlaces(query: string, limit = 6): Promise<GeocodedPl
 
 export async function reverseGeocode(lat: number, lng: number): Promise<GeocodedPlace | null> {
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null
-  const url = `${NOMINATIM_BASE}/reverse?format=jsonv2&addressdetails=1&lat=${encodeURIComponent(String(lat))}&lon=${encodeURIComponent(String(lng))}`
+  const url = nominatimUrl(
+    `/reverse?format=jsonv2&addressdetails=1&lat=${encodeURIComponent(String(lat))}&lon=${encodeURIComponent(String(lng))}`,
+  )
   try {
     const response = await fetch(url, {
       signal: AbortSignal.timeout(7000),

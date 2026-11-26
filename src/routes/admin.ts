@@ -115,30 +115,30 @@ adminRouter.get('/products', async (req, res, next) => {
     const { page, pageSize, skip } = pageParams(
       req.query as Record<string, unknown>,
     )
-    const q = String(req.query.q ?? '').trim()
-    const storeId = String(req.query.storeId ?? '')
+  const q = String(req.query.q ?? '').trim()
+  const storeId = String(req.query.storeId ?? '')
 
     if (storeId) await assertStoreAccess(req.user!, storeId)
 
     const allowed = await accessibleStoreIds(req.user!)
 
-    const where: Prisma.ProductWhereInput = {
+  const where: Prisma.ProductWhereInput = {
       ...(allowed
         ? { storeId: { in: allowed.length ? allowed : ['__none__'] } }
         : {}),
-      ...(storeId ? { storeId } : {}),
-      ...(q
+    ...(storeId ? { storeId } : {}),
+    ...(q
         ? {
             OR: [
               { name: { contains: q, mode: 'insensitive' } },
               { sku: { contains: q, mode: 'insensitive' } },
             ],
           }
-        : {}),
-    }
+      : {}),
+  }
 
-    const [total, items] = await Promise.all([
-      prisma.product.count({ where }),
+  const [total, items] = await Promise.all([
+    prisma.product.count({ where }),
       prisma.product.findMany({
         where,
         include: { store: true },
@@ -148,37 +148,37 @@ adminRouter.get('/products', async (req, res, next) => {
       }),
     ])
 
-    res.json({
-      page,
-      pageSize,
-      total,
-      pages: Math.max(1, Math.ceil(total / pageSize)),
-      items: items.map((product) => ({
-        id: product.id,
-        storeId: product.storeId,
-        storeName: product.store.name,
-        name: product.name,
-        brand: product.brand,
+  res.json({
+    page,
+    pageSize,
+    total,
+    pages: Math.max(1, Math.ceil(total / pageSize)),
+    items: items.map((product) => ({
+      id: product.id,
+      storeId: product.storeId,
+      storeName: product.store.name,
+      name: product.name,
+      brand: product.brand,
         genericName: product.genericName,
         strength: product.strength,
-        category: product.category,
-        price: money(product.price),
-        unitLabel: product.unitLabel,
-        sku: product.sku,
-        stock: product.stock,
-        batch: product.batch,
-        expiry: product.expiry,
+      category: product.category,
+      price: money(product.price),
+      unitLabel: product.unitLabel,
+      sku: product.sku,
+      stock: product.stock,
+      batch: product.batch,
+      expiry: product.expiry,
         expired: isExpired(product.expiry),
-        held: product.held,
-        onlineSale: product.onlineSale,
+      held: product.held,
+      onlineSale: product.onlineSale,
         published: product.published,
         outOfStock: product.stock <= 0,
-        rxRequired: product.rxRequired,
-        lowStockAlerts: product.lowStockAlerts,
-        description: product.description,
-        imageUrl: product.imageUrl,
-      })),
-    })
+      rxRequired: product.rxRequired,
+      lowStockAlerts: product.lowStockAlerts,
+      description: product.description,
+      imageUrl: product.imageUrl,
+    })),
+  })
   } catch (error) {
     next(error)
   }
@@ -199,7 +199,7 @@ adminRouter.get('/categories', async (req, res, next) => {
       orderBy: { category: 'asc' },
     })
 
-    const defaults = ['Medicines', 'Vitamins', 'Supplements', 'Devices']
+  const defaults = ['Medicines', 'Vitamins', 'Supplements', 'Devices']
 
     const categories = [
       ...new Set([
@@ -208,7 +208,7 @@ adminRouter.get('/categories', async (req, res, next) => {
       ]),
     ].sort()
 
-    res.json({ categories })
+  res.json({ categories })
   } catch (error) {
     next(error)
   }
@@ -862,12 +862,12 @@ adminRouter.post('/riders/:id/reject', async (req, res, next) => {
 adminRouter.post('/riders', async (req, res, next) => {
   try {
     const body = z.object({
-      storeId: z.string().min(1),
-      name: z.string().trim().min(1).max(80),
-      phone: z.string().trim().max(40).optional(),
-      vehicle: z.string().trim().max(40).optional(),
-      notes: z.string().trim().max(240).optional(),
-      active: z.boolean().optional(),
+        storeId: z.string().min(1),
+        name: z.string().trim().min(1).max(80),
+        phone: z.string().trim().max(40).optional(),
+        vehicle: z.string().trim().max(40).optional(),
+        notes: z.string().trim().max(240).optional(),
+        active: z.boolean().optional(),
       isPrimary: z.boolean().optional(),
       email: z.string().trim().email().optional(),
       password: z.string().min(6).max(120).optional(),
@@ -935,11 +935,11 @@ adminRouter.patch('/riders/:id', async (req, res, next) => {
     await assertStoreAccess(req.user!, existing.storeId)
 
     const body = z.object({
-      name: z.string().trim().min(1).max(80).optional(),
-      phone: z.string().trim().max(40).optional(),
-      vehicle: z.string().trim().max(40).optional(),
-      notes: z.string().trim().max(240).optional(),
-      active: z.boolean().optional(),
+        name: z.string().trim().min(1).max(80).optional(),
+        phone: z.string().trim().max(40).optional(),
+        vehicle: z.string().trim().max(40).optional(),
+        notes: z.string().trim().max(240).optional(),
+        active: z.boolean().optional(),
       isPrimary: z.boolean().optional(),
       email: z.string().trim().email().optional(),
       password: z.string().min(6).max(120).optional(),
@@ -1068,6 +1068,13 @@ adminRouter.post('/orders/:number/status', async (req, res, next) => {
       })
     }
 
+    const isCod =
+      /cash on delivery|^cod$/i.test(order.paymentLabel || '') || order.paymentStatus === 'unpaid'
+    const markCodCollected =
+      isCod &&
+      order.paymentStatus === 'unpaid' &&
+      (body.status === 'delivered' || body.status === 'collected')
+
     await prisma.order.update({
       where: { id: order.id },
       data: {
@@ -1085,7 +1092,9 @@ adminRouter.post('/orders/:number/status', async (req, res, next) => {
                 ? 'refunded'
                 : 'partially_refunded',
             }
-          : {}),
+          : markCodCollected
+            ? { paymentStatus: 'paid' }
+            : {}),
       },
     })
 
@@ -1323,9 +1332,9 @@ adminRouter.post('/pharmacies', async (req, res, next) => {
         .min(2)
         .max(12)
         .regex(/^[A-Za-z0-9_-]+$/, 'Store code must be letters, numbers, - or _'),
-      name: z.string().trim().min(1).max(120),
+        name: z.string().trim().min(1).max(120),
       address: z.string().trim().min(5).max(240),
-      openUntil: z.string().trim().min(1).max(40).default('9:00 PM'),
+        openUntil: z.string().trim().min(1).max(40).default('9:00 PM'),
       phone: z.union([
         z.literal(''),
         z.string().trim().regex(
@@ -1333,17 +1342,17 @@ adminRouter.post('/pharmacies', async (req, res, next) => {
           'Enter a valid phone number',
         ),
       ]).optional(),
-      pharmacist: z.string().trim().max(80).optional(),
+        pharmacist: z.string().trim().max(80).optional(),
       pharmacistUserId: z.string().optional(),
       managerUserId: z.string().optional(),
       status: z.enum(['draft', 'active']).optional(),
-      isOpen: z.boolean().optional(),
+        isOpen: z.boolean().optional(),
       acceptingOrders: z.boolean().optional(),
       weeklyHours: z.record(z.any()).optional(),
       mapLat: z.number().optional(),
       mapLng: z.number().optional(),
-      standardDelivery: z.number().min(0).optional(),
-      expressDelivery: z.number().min(0).optional(),
+        standardDelivery: z.number().min(0).optional(),
+        expressDelivery: z.number().min(0).optional(),
     }).parse(req.body)
 
     const code = body.code.toUpperCase()
@@ -1381,13 +1390,13 @@ adminRouter.post('/pharmacies', async (req, res, next) => {
 
     const storeId = await prisma.$transaction(async (tx) => {
       const store = await tx.store.create({
-        data: {
+      data: {
           code,
-          name: body.name,
-          address: body.address,
-          openUntil: body.openUntil,
-          phone: body.phone ?? '',
-          pharmacist: body.pharmacist ?? '',
+        name: body.name,
+        address: body.address,
+        openUntil: body.openUntil,
+        phone: body.phone ?? '',
+        pharmacist: body.pharmacist ?? '',
           pharmacistUserId: body.pharmacistUserId ?? null,
           managerUserId: body.managerUserId ?? null,
           status,

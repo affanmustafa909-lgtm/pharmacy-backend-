@@ -6,7 +6,8 @@ import { HttpError } from '../lib/http.js'
 import { prisma } from '../lib/prisma.js'
 import { notifyCustomer, notifyRiderInbox } from './notifications.js'
 import { getDeliveryDistanceKm } from './distance.js'
-import { formatAddressLine, geocodeStructuredAddress } from './geocode.js'
+import { formatAddressLine as formatCustomerLine } from './deliveryAddress.js'
+import { geocodeStructuredAddress } from './geocode.js'
 import { dec, money } from './money.js'
 import { findAssignedRiderForStore } from './riders.js'
 
@@ -72,15 +73,17 @@ export async function quoteOrder(input: {
       throw new HttpError(400, 'Selected delivery address was not found')
     }
 
-    resolvedAddressLine = formatAddressLine({
-      street: address.street,
-      subCity: address.subCity,
-      city: address.city,
-      state: address.state,
-      postalCode: address.postalCode,
-      country: address.country,
-      fallback: address.line,
-    })
+    // Show only what the customer entered — do not append geocoded state/country
+    // (Nominatim often returns local-script names the user never typed).
+    resolvedAddressLine =
+      formatCustomerLine({
+        houseNo: address.houseNo,
+        street: address.street,
+        area: address.subCity,
+        city: address.city,
+        landmark: address.landmark,
+        line: address.line,
+      }) || address.line
 
     let toLat = address.latitude
     let toLng = address.longitude
@@ -241,7 +244,12 @@ export async function placeOrder(input: {
   addressId?: string
   deliveryType: DeliveryType
   paymentLabel: string
+  paymentStatus?: 'paid' | 'unpaid'
   addressLine: string
+  recipientName?: string
+  recipientPhone?: string
+  addressJson?: Prisma.InputJsonValue
+  checkoutGroupId?: string
   items: { productId: string; quantity: number }[]
   promoCode?: string
   prescriptionNumber?: string
@@ -260,17 +268,12 @@ export async function placeOrder(input: {
   }
   input.customerId = customer.id
   const quoted = await quoteOrder({ ...input, enforceRx: true })
+  const paymentStatus = input.paymentStatus === 'unpaid' ? 'unpaid' : 'paid'
 
-  // Delivery orders go to the pharmacy's assigned active rider only.
+  // Assign an active rider when available; otherwise leave waiting for assignment.
   let assignedRider: Awaited<ReturnType<typeof findAssignedRiderForStore>> = null
   if (input.deliveryType !== 'pickup') {
     assignedRider = await findAssignedRiderForStore(input.storeId)
-    if (!assignedRider) {
-      throw new HttpError(
-        409,
-        'No active rider is assigned to this pharmacy yet. Please choose another pharmacy or try again later.',
-      )
-    }
   }
 
   const order = await prisma.$transaction(async (tx) => {
@@ -318,9 +321,10 @@ export async function placeOrder(input: {
         number,
         customerId: input.customerId,
         storeId: input.storeId,
+        checkoutGroupId: input.checkoutGroupId,
         riderId: assignedRider?.id ?? null,
         status: 'placed',
-        paymentStatus: 'paid',
+        paymentStatus,
         channel: 'Mobile app',
         deliveryType: input.deliveryType,
         paymentLabel: input.paymentLabel,
@@ -328,6 +332,9 @@ export async function placeOrder(input: {
           input.deliveryType === 'pickup'
             ? quoted.store.address
             : quoted.resolvedAddressLine || input.addressLine,
+        recipientName: String(input.recipientName ?? '').trim(),
+        recipientPhone: String(input.recipientPhone ?? '').trim(),
+        addressJson: input.addressJson,
         deliveryDistanceKm: quoted.deliveryDistanceKm,
         prescriptionNumber: input.prescriptionNumber ?? '',
         productSubtotal: dec(quoted.charges.productSubtotal),
@@ -368,11 +375,19 @@ export async function placeOrder(input: {
                     actor: 'System',
                   },
                 ]
-              : []),
+              : input.deliveryType !== 'pickup'
+                ? [
+                    {
+                      label: 'Waiting for rider assignment',
+                      detail: 'A rider will be assigned soon',
+                      actor: 'System',
+                    },
+                  ]
+                : []),
           ],
         },
       },
-      include: { items: true, charges: true, store: true, rider: true },
+      include: { items: true, charges: true, store: true, rider: true, activities: true },
     })
 
     // Pickup orders still surface on the pharmacy desk. Delivery orders notify
@@ -471,11 +486,15 @@ export async function recheckBuyAgain(input: {
 export function mapOrderDetail(order: {
   number: string
   status: string
+  paymentStatus?: string
+  checkoutGroupId?: string | null
   total: Prisma.Decimal
   discount: Prisma.Decimal
   deliveryType: string
   paymentLabel: string
   addressLine: string
+  recipientName?: string | null
+  recipientPhone?: string | null
   deliveryDistanceKm: number | null
   createdAt: Date
   productSubtotal: Prisma.Decimal
@@ -501,6 +520,7 @@ export function mapOrderDetail(order: {
   }>
   store: { name: string; address: string; openUntil: string; phone: string }
   rider?: { id: string; name: string; phone: string; vehicle: string } | null
+  activities?: Array<{ label: string; detail: string; actor: string; createdAt: Date }>
 }) {
   const pickup = order.deliveryType === 'pickup'
   const pickupRank: Record<string, number> = {
@@ -518,19 +538,39 @@ export function mapOrderDetail(order: {
     cancelled: 0,
   }
   const completed = (pickup ? pickupRank : deliveryRank)[order.status] ?? 1
+  const activities = (order.activities ?? [])
+    .slice()
+    .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+    .map((row) => ({
+      label: row.label,
+      detail: row.detail,
+      actor: row.actor,
+      at: row.createdAt.toISOString(),
+    }))
+  const activityTime = (index: number) => {
+    const row = activities[index]
+    if (!row) return null
+    return new Date(row.at).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+  }
   return {
     id: order.number,
     status: order.status,
+    paymentStatus: order.paymentStatus ?? 'paid',
+    checkoutGroupId: order.checkoutGroupId ?? null,
     total: money(order.total),
     discount: money(order.discount),
     deliveryType: order.deliveryType,
     paymentLabel: order.paymentLabel,
     addressLine: order.addressLine,
+    recipientName: String(order.recipientName ?? '').trim() || null,
+    recipientPhone: String(order.recipientPhone ?? '').trim() || null,
     deliveryDistanceKm: order.deliveryDistanceKm,
     storeName: order.store.name,
     storeAddress: order.store.address,
     openUntil: order.store.openUntil,
     storePhone: order.store.phone,
+    riderName: order.rider?.name ?? null,
+    riderPhone: order.rider?.phone ?? null,
     rider: order.rider
       ? {
           id: order.rider.id,
@@ -539,6 +579,7 @@ export function mapOrderDetail(order: {
           vehicle: order.rider.vehicle,
         }
       : null,
+    waitingForRider: !pickup && !order.rider,
     createdAt: order.createdAt.toISOString(),
     productSubtotal: money(order.productSubtotal),
     deliveryCharge: money(order.deliveryCharge),
@@ -562,36 +603,308 @@ export function mapOrderDetail(order: {
       rate: money(charge.rate),
       percentBase: charge.percentBase,
     })),
+    activities,
     steps: pickup
       ? [
-          { id: 'confirmed', title: 'Order confirmed', completed: completed >= 1 },
-          { id: 'packed', title: 'Preparing for pickup', completed: completed >= 2 },
-          { id: 'ready', title: 'Ready for pickup', completed: completed >= 3 },
-          { id: 'collected', title: 'Collected', completed: completed >= 4 },
+          {
+            id: 'confirmed',
+            title: 'Order confirmed',
+            completed: completed >= 1,
+            timeLabel: activityTime(0) ?? undefined,
+          },
+          {
+            id: 'packed',
+            title: 'Preparing for pickup',
+            completed: completed >= 2,
+            timeLabel: activityTime(1) ?? undefined,
+          },
+          {
+            id: 'ready',
+            title: 'Ready for pickup',
+            completed: completed >= 3,
+            timeLabel: activityTime(2) ?? undefined,
+          },
+          {
+            id: 'collected',
+            title: 'Collected',
+            completed: completed >= 4,
+            timeLabel: activityTime(3) ?? undefined,
+          },
         ]
       : [
-          { id: 'confirmed', title: 'Order placed', completed: completed >= 1 },
-          { id: 'packed', title: 'Rider confirmed', completed: completed >= 2 },
-          { id: 'on_way', title: 'Picked up · On the way', completed: completed >= 3 },
-          { id: 'delivered', title: 'Delivered', completed: completed >= 4 },
+          {
+            id: 'confirmed',
+            title: 'Order placed',
+            completed: completed >= 1,
+            timeLabel: activityTime(0) ?? undefined,
+          },
+          {
+            id: 'packed',
+            title: order.rider ? 'Rider assigned' : 'Waiting for rider assignment',
+            completed: completed >= 2 || Boolean(order.rider),
+            timeLabel: activityTime(1) ?? undefined,
+          },
+          {
+            id: 'on_way',
+            title: 'Picked up · On the way',
+            completed: completed >= 3,
+            timeLabel: activityTime(2) ?? undefined,
+          },
+          {
+            id: 'delivered',
+            title: 'Delivered',
+            completed: completed >= 4,
+            timeLabel: activityTime(3) ?? undefined,
+          },
         ],
   }
 }
 
-export function receiptHtml(detail: ReturnType<typeof mapOrderDetail>) {
+function storeSectionHtml(detail: ReturnType<typeof mapOrderDetail>) {
   const rows = detail.items
     .map(
       (item) =>
         `<tr><td>${item.name}</td><td>${item.quantity}</td><td>$${item.unitPrice.toFixed(2)}</td><td>$${item.lineTotal.toFixed(2)}</td></tr>`,
     )
     .join('')
-  return `<!doctype html><html><head><meta charset="utf-8"><title>Receipt ${detail.id}</title>
-  <style>body{font-family:Georgia,serif;color:#131315;padding:24px}table{width:100%;border-collapse:collapse;margin:16px 0}td,th{border-bottom:1px solid #e5e5e5;padding:8px;text-align:left}.muted{color:#8a8a8e}</style></head>
-  <body><h1>Hera Pharmacy</h1><p class="muted">${detail.id} · ${new Date(detail.createdAt).toLocaleString()}</p>
-  <p>${detail.storeName}<br/>${detail.storeAddress}</p>
+  return `<section style="margin:20px 0;padding-bottom:16px;border-bottom:1px solid #e5e5e5">
+  <h2 style="margin:0 0 6px;font-size:18px">${detail.storeName}</h2>
+  <p class="muted" style="margin:0 0 8px">${detail.id} · ${detail.storeAddress}</p>
   <table><thead><tr><th>Product</th><th>Qty</th><th>Price</th><th>Total</th></tr></thead><tbody>${rows}</tbody></table>
-  <p>Products: $${detail.productSubtotal.toFixed(2)}<br/>Delivery: $${detail.deliveryCharge.toFixed(2)}<br/>Service: $${detail.serviceCharge.toFixed(2)}<br/>BFP: $${detail.bfpCharge.toFixed(2)}<br/>Discount: $${detail.discount.toFixed(2)}<br/><strong>Total: $${detail.total.toFixed(2)}</strong></p>
-  <p class="muted">${detail.deliveryType} · ${detail.paymentLabel}</p></body></html>`
+  <p>Products: $${detail.productSubtotal.toFixed(2)}<br/>Delivery: $${detail.deliveryCharge.toFixed(2)}<br/>Service: $${detail.serviceCharge.toFixed(2)}<br/>BFP: $${detail.bfpCharge.toFixed(2)}<br/>Discount: $${detail.discount.toFixed(2)}<br/><strong>Store total: $${detail.total.toFixed(2)}</strong></p>
+  </section>`
+}
+
+export function receiptHtml(
+  detail: ReturnType<typeof mapOrderDetail>,
+  related: Array<ReturnType<typeof mapOrderDetail>> = [],
+) {
+  const stores = [detail, ...related.filter((row) => row.id !== detail.id)]
+  const combinedTotal = Math.round(stores.reduce((sum, row) => sum + row.total, 0) * 100) / 100
+  const splitNote =
+    stores.length > 1
+      ? `<p class="note"><strong>Multi-store checkout</strong> — ${stores.length} pharmacy orders in this receipt.</p>`
+      : ''
+  const recipient = [detail.recipientName, detail.recipientPhone].filter(Boolean).join(' · ')
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Receipt ${detail.id}</title>
+  <style>
+    :root{color-scheme:light}
+    body{margin:0;background:#eeede9;color:#131315;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+    .sheet{max-width:440px;margin:24px auto;background:#fff;border-radius:24px;padding:28px 24px;box-shadow:0 10px 30px rgba(17,17,17,.08)}
+    .brand{display:flex;align-items:center;gap:12px;margin-bottom:18px}
+    .mark{width:42px;height:42px;border-radius:14px;background:#171a18;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:800}
+    h1{margin:0;font-size:22px} .sub{color:#8a8a8e;font-size:13px;margin-top:2px}
+    .meta{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0}
+    .cell{background:#f5f5f3;border-radius:14px;padding:12px}
+    .label{font-size:11px;font-weight:700;color:#a0a0a4;text-transform:uppercase}
+    .value{font-size:13px;font-weight:600;margin-top:4px;text-transform:capitalize}
+    .addr{border:1px solid #e5e5e5;border-radius:14px;padding:12px;margin:12px 0}
+    table{width:100%;border-collapse:collapse;margin:12px 0} th,td{padding:8px 0;text-align:left;border-bottom:1px solid #e5e5e5;font-size:13px}
+    th{color:#a0a0a4;font-size:11px;text-transform:uppercase}
+    .totals p{display:flex;justify-content:space-between;margin:6px 0;font-size:13px}
+    .grand{margin-top:16px;background:#171a18;color:#fff;border-radius:16px;padding:16px;display:flex;justify-content:space-between;align-items:center}
+    .grand strong{font-size:22px}
+    .pill{display:inline-block;background:#e6f7f5;color:#1f9a8c;border-radius:999px;padding:6px 12px;font-size:12px;font-weight:700}
+    .muted{color:#8a8a8e}.note{background:#e6f7f5;border-radius:12px;padding:10px 12px}
+    .thanks{text-align:center;color:#8a8a8e;margin-top:18px;font-size:13px}
+  </style></head>
+  <body><div class="sheet">
+    <div class="brand"><div class="mark">H</div><div><h1>Hera Pharmacy</h1><div class="sub">Official order receipt</div></div></div>
+    <div class="meta">
+      <div class="cell"><div class="label">Date</div><div class="value">${new Date(detail.createdAt).toLocaleString()}</div></div>
+      <div class="cell"><div class="label">Payment</div><div class="value">${detail.paymentLabel} · ${detail.paymentStatus}</div></div>
+    </div>
+    <div class="addr">
+      <div class="label">${detail.deliveryType === 'pickup' ? 'Pickup' : 'Deliver to'}</div>
+      ${recipient ? `<div class="value">${recipient}</div>` : ''}
+      <div class="muted" style="margin-top:4px">${detail.addressLine || 'Store pickup'}</div>
+    </div>
+    ${splitNote}
+    ${stores.map(storeSectionHtml).join('')}
+    <div class="grand"><span class="muted" style="color:rgba(255,255,255,.75)">Final total</span><strong>$${combinedTotal.toFixed(2)}</strong></div>
+    <p class="thanks">Thank you for choosing Hera</p>
+  </div></body></html>`
+}
+
+async function resolveCustomerAddressId(customerId: string, addressId?: string) {
+  if (addressId) {
+    const match = await prisma.customerAddress.findFirst({
+      where: { id: addressId, customerId },
+      select: { id: true },
+    })
+    if (match) return match.id
+  }
+  const fallback = await prisma.customerAddress.findFirst({
+    where: { customerId },
+    orderBy: [{ isDefault: 'desc' }, { label: 'asc' }],
+    select: { id: true },
+  })
+  return fallback?.id
+}
+
+export async function planCheckoutSplit(input: {
+  customerId: string
+  deliveryType: DeliveryType
+  items: { productId: string; quantity: number }[]
+  promoCode?: string
+  prescriptionNumber?: string
+  addressId?: string
+}) {
+  if (!input.items.length) throw new HttpError(400, 'Cart is empty', 'EMPTY_CART')
+  const addressId =
+    input.deliveryType === 'pickup' ? undefined : await resolveCustomerAddressId(input.customerId, input.addressId)
+  if (input.deliveryType !== 'pickup' && !addressId) {
+    throw new HttpError(400, 'Select a saved delivery address')
+  }
+  const products = await prisma.product.findMany({
+    where: { id: { in: input.items.map((item) => item.productId) } },
+    include: { store: true },
+  })
+  const byId = new Map(products.map((product) => [product.id, product]))
+  const groups = new Map<string, { productId: string; quantity: number }[]>()
+  for (const item of input.items) {
+    const product = byId.get(item.productId)
+    if (!product) throw new HttpError(400, 'A product in the cart was removed and cannot be ordered')
+    const list = groups.get(product.storeId) ?? []
+    list.push(item)
+    groups.set(product.storeId, list)
+  }
+
+  const storePlans = []
+  for (const [storeId, items] of groups) {
+    const quoted = await quoteOrder({
+      storeId,
+      addressId,
+      deliveryType: input.deliveryType,
+      items,
+      promoCode: input.promoCode,
+      prescriptionNumber: input.prescriptionNumber,
+      customerId: input.customerId,
+      enforceRx: false,
+    })
+    storePlans.push({
+      storeId,
+      storeName: quoted.store.name,
+      storeAddress: quoted.store.address,
+      items: quoted.lines.map((line) => ({
+        productId: line.product.id,
+        name: line.product.name,
+        sku: line.product.sku,
+        quantity: line.quantity,
+        unitPrice: line.unitPrice,
+        lineTotal: line.lineTotal,
+      })),
+      ...quoted.charges,
+      etaMinutes: input.deliveryType === 'express' ? 30 : input.deliveryType === 'pickup' ? 20 : 60,
+    })
+  }
+
+  const combinedTotal = Math.round(storePlans.reduce((sum, plan) => sum + plan.total, 0) * 100) / 100
+  return {
+    split: storePlans.length > 1,
+    stores: storePlans,
+    combinedTotal,
+    message:
+      storePlans.length > 1
+        ? 'Your cart ships from more than one pharmacy. Confirm the split to place both orders together.'
+        : null,
+  }
+}
+
+export async function placeMultiStoreCheckout(input: {
+  customerId: string
+  customerEmail?: string
+  idempotencyKey: string
+  deliveryType: DeliveryType
+  paymentLabel: string
+  paymentStatus?: 'paid' | 'unpaid'
+  recipientName: string
+  recipientPhone: string
+  addressLine: string
+  addressId?: string
+  addressJson?: Prisma.InputJsonValue
+  items: { productId: string; quantity: number }[]
+  promoCode?: string
+  prescriptionNumber?: string
+  confirmSplit?: boolean
+}) {
+  const existing = await prisma.checkoutGroup.findUnique({
+    where: { idempotencyKey: input.idempotencyKey },
+    include: { orders: { include: { items: true, charges: true, store: true, rider: true } } },
+  })
+  if (existing) {
+    return {
+      checkoutGroupId: existing.id,
+      orders: existing.orders,
+      combinedTotal: existing.orders.reduce((sum, order) => sum + money(order.total), 0),
+      reused: true,
+    }
+  }
+
+  const addressId =
+    input.deliveryType === 'pickup'
+      ? undefined
+      : await resolveCustomerAddressId(input.customerId, input.addressId)
+
+  const plan = await planCheckoutSplit({
+    customerId: input.customerId,
+    deliveryType: input.deliveryType,
+    items: input.items,
+    promoCode: input.promoCode,
+    prescriptionNumber: input.prescriptionNumber,
+    addressId,
+  })
+  if (plan.split && !input.confirmSplit) {
+    throw new HttpError(409, plan.message || 'Confirm the multi-store split before placing orders', 'CONFIRM_SPLIT')
+  }
+  if (input.deliveryType !== 'pickup' && !input.addressLine.trim()) {
+    throw new HttpError(400, 'Add a delivery address')
+  }
+  if (!input.recipientName.trim() || !input.recipientPhone.trim()) {
+    throw new HttpError(400, 'Add recipient name and phone number')
+  }
+
+  const group = await prisma.checkoutGroup.create({
+    data: {
+      customerId: input.customerId,
+      idempotencyKey: input.idempotencyKey,
+      deliveryType: input.deliveryType,
+      paymentLabel: input.paymentLabel,
+      recipientName: input.recipientName.trim(),
+      recipientPhone: input.recipientPhone.trim(),
+      addressLine: input.addressLine,
+      addressJson: input.addressJson,
+    },
+  })
+
+  const orders = []
+  for (const storePlan of plan.stores) {
+    const order = await placeOrder({
+      customerId: input.customerId,
+      customerEmail: input.customerEmail,
+      storeId: storePlan.storeId,
+      addressId,
+      deliveryType: input.deliveryType,
+      paymentLabel: input.paymentLabel,
+      paymentStatus: input.paymentStatus,
+      addressLine: input.addressLine,
+      recipientName: input.recipientName,
+      recipientPhone: input.recipientPhone,
+      addressJson: input.addressJson,
+      checkoutGroupId: group.id,
+      items: storePlan.items.map((item) => ({ productId: item.productId, quantity: item.quantity })),
+      promoCode: input.promoCode,
+      prescriptionNumber: input.prescriptionNumber,
+    })
+    orders.push(order)
+  }
+
+  return {
+    checkoutGroupId: group.id,
+    orders,
+    combinedTotal: Math.round(orders.reduce((sum, order) => sum + money(order.total), 0) * 100) / 100,
+    reused: false,
+  }
 }
 
 export type Tx = Prisma.TransactionClient
