@@ -5,6 +5,7 @@ import { HttpError } from '../lib/http.js'
 import { prisma } from '../lib/prisma.js'
 import { notifyCustomer } from './notifications.js'
 import { dec, money } from './money.js'
+import { assertPromoUsable } from './promos.js'
 
 export type DeliveryType = 'standard' | 'express' | 'pickup'
 
@@ -20,7 +21,7 @@ export function toRule(rule: ChargeRule): ChargeRuleInput {
   }
 }
 
-type VerifiedItem = { name?: string; strength?: string; quantity?: string; sku?: string }
+type VerifiedItem = { name?: string; strength?: string; quantity?: string; sku?: string; approvedQty?: number }
 
 function matchesVerified(productName: string, sku: string, items: VerifiedItem[]) {
   const name = productName.toLowerCase()
@@ -73,33 +74,24 @@ export async function quoteOrder(input: {
     return { product, quantity: item.quantity, unitPrice, lineTotal }
   })
 
-  const rxLines = lines.filter((line) => line.product.rxRequired)
+  const rxLines = lines.filter((line) => line.product.rxRequired || line.product.controlled)
+  let controlledPrescriptionId: string | null = null
   if (input.enforceRx && rxLines.length) {
     if (!input.customerId) throw new HttpError(401, 'Sign in to order prescription medicines')
     const prescription = input.prescriptionNumber
       ? await prisma.prescription.findFirst({
-          where: {
-            number: input.prescriptionNumber,
-            customerId: input.customerId,
-            storeId: input.storeId,
-            status: 'approved',
-          },
+          where: { number: input.prescriptionNumber, customerId: input.customerId, storeId: input.storeId, status: 'approved' },
         })
       : await prisma.prescription.findFirst({
-          where: {
-            customerId: input.customerId,
-            storeId: input.storeId,
-            status: 'approved',
-          },
+          where: { customerId: input.customerId, storeId: input.storeId, status: 'approved' },
           orderBy: { updatedAt: 'desc' },
         })
     if (!prescription) {
       throw new HttpError(400, 'A pharmacist-verified prescription is required before checkout', 'RX_REQUIRED')
     }
-    const verified = Array.isArray(prescription.verifiedItems)
-      ? (prescription.verifiedItems as VerifiedItem[])
-      : []
+    const verified = Array.isArray(prescription.verifiedItems) ? (prescription.verifiedItems as VerifiedItem[]) : []
     const fallbackName = prescription.medicineName
+    const controlledLines = lines.filter((line) => line.product.controlled)
     for (const line of rxLines) {
       const ok =
         matchesVerified(line.product.name, line.product.sku, verified) ||
@@ -108,24 +100,58 @@ export async function quoteOrder(input: {
         throw new HttpError(400, `${line.product.name} needs pharmacist verification before checkout`, 'RX_REQUIRED')
       }
     }
+    if (controlledLines.length) {
+      // ADM-02: stricter rules for controlled medicines.
+      if (!prescription.prescriber.trim()) {
+        throw new HttpError(400, 'This prescription has no prescriber name. Controlled medicines cannot be sold.', 'RX_CONTROLLED')
+      }
+      if (prescription.orderNumber) {
+        throw new HttpError(400, 'This prescription was already used for an order. Controlled medicines need a new prescription.', 'RX_USED')
+      }
+      const reviewed = prescription.reviewedAt ?? prescription.submittedAt
+      if (Date.now() - reviewed.getTime() > 30 * 86400000) {
+        throw new HttpError(400, 'This prescription is older than 30 days. Upload a new one.', 'RX_OLD')
+      }
+      for (const line of controlledLines) {
+        const item = verified.find(
+          (v) =>
+            (v.sku && v.sku.toLowerCase() === line.product.sku.toLowerCase()) ||
+            String(v.name ?? '').toLowerCase() === line.product.name.toLowerCase(),
+        )
+        const allowedQty = item?.approvedQty ?? (Number(item?.quantity) || 0)
+        if (!item || allowedQty < 1) {
+          throw new HttpError(400, `${line.product.name} is not on the approved prescription`, 'RX_CONTROLLED')
+        }
+        if (line.quantity > allowedQty) {
+          throw new HttpError(400, `${line.product.name}: prescription allows only ${allowedQty}`, 'RX_CONTROLLED')
+        }
+      }
+      controlledPrescriptionId = prescription.id
+    }
   }
 
   const rules = await prisma.chargeRule.findMany({ where: { storeId: input.storeId, active: true } })
   const charges = calculateCharges(productSubtotal, input.deliveryType, rules.map(toRule))
   let discount = 0
   let promoLabel = ''
+  let promoId: string | null = null
   if (input.promoCode?.trim()) {
     const promo = await prisma.promoCode.findFirst({
-      where: { code: input.promoCode.trim().toUpperCase(), active: true },
+      where: { code: input.promoCode.trim().toUpperCase() },
     })
     if (!promo) throw new HttpError(400, 'Promo code is not valid')
-    discount = money(promo.discount)
+    await assertPromoUsable(promo, { storeId: input.storeId, customerId: input.customerId })
+    // The discount can never be bigger than the bill.
+    discount = Math.min(money(promo.discount), charges.total)
     promoLabel = promo.code
+    promoId = promo.id
   }
   const total = Math.max(0, Math.round((charges.total - discount) * 100) / 100)
   return {
     lines,
     store,
+    promoId,
+    controlledPrescriptionId,
     charges: { ...charges, discount, total, promoCode: promoLabel || null },
   }
 }
@@ -162,6 +188,26 @@ export async function placeOrder(input: {
         data: { stock: { decrement: line.quantity } },
       })
       if (updated.count !== 1) throw new HttpError(409, `${line.product.name} just sold out`)
+    }
+    // ADM-05: lock the promo row so two customers cannot both take the last use.
+    if (quoted.promoId) {
+      await tx.$queryRaw`SELECT id FROM "PromoCode" WHERE id = ${quoted.promoId} FOR UPDATE`
+      const promo = await tx.promoCode.findUnique({ where: { id: quoted.promoId } })
+      if (!promo) throw new HttpError(400, 'Promo code is not valid')
+      const now = new Date()
+      if (!promo.active || (promo.endsAt && now > promo.endsAt) || (promo.startsAt && now < promo.startsAt)) {
+        throw new HttpError(400, 'This promo is no longer available', 'PROMO_EXPIRED')
+      }
+      if (promo.maxUses != null) {
+        const used = await tx.promoRedemption.count({ where: { promoId: promo.id, order: { status: { not: 'cancelled' } } } })
+        if (used >= promo.maxUses) throw new HttpError(400, 'This promo has reached its usage limit', 'PROMO_LIMIT')
+      }
+      if (promo.perCustomerLimit != null) {
+        const mine = await tx.promoRedemption.count({
+          where: { promoId: promo.id, customerId: input.customerId, order: { status: { not: 'cancelled' } } },
+        })
+        if (mine >= promo.perCustomerLimit) throw new HttpError(400, 'You have already used this promo the maximum number of times', 'PROMO_CUSTOMER_LIMIT')
+      }
     }
     const count = await tx.order.count()
     const number = `RX-${10480 + count + 1}`
@@ -240,6 +286,22 @@ export async function placeOrder(input: {
       },
       include: { items: true, charges: true, store: true },
     })
+    if (quoted.promoId && quoted.charges.discount > 0) {
+      await tx.promoRedemption.create({
+        data: { promoId: quoted.promoId, orderId: created.id, customerId: input.customerId, discount: dec(quoted.charges.discount) },
+      })
+    }
+    if (quoted.controlledPrescriptionId) {
+      await tx.prescription.update({ where: { id: quoted.controlledPrescriptionId }, data: { orderNumber: number } })
+      await tx.auditLog.create({
+        data: {
+          storeId: input.storeId,
+          action: 'controlled.sale',
+          detail: `${number}: ${quoted.lines.filter((l) => l.product.controlled).map((l) => `${l.product.name} x${l.quantity}`).join(', ')}`,
+          meta: { order: number, prescriptionId: quoted.controlledPrescriptionId },
+        },
+      })
+    }
     await tx.notice.create({
       data: {
         title: 'New app order',
@@ -342,6 +404,7 @@ export function mapOrderDetail(order: {
     percentBase: string | null
   }>
   store: { name: string; address: string; openUntil: string; phone: string }
+  rider?: { name: string; phone: string; vehicle: string } | null
 }) {
   const pickup = order.deliveryType === 'pickup'
   const pickupRank: Record<string, number> = {
@@ -377,6 +440,7 @@ export function mapOrderDetail(order: {
     serviceCharge: money(order.serviceCharge),
     bfpCharge: money(order.bfpCharge),
     prescriptionNumber: order.prescriptionNumber || null,
+    rider: order.rider ? { name: order.rider.name, phone: order.rider.phone, vehicle: order.rider.vehicle } : null,
     itemCount: order.items.reduce((sum, item) => sum + item.quantity, 0),
     items: order.items.map((item) => ({
       productId: item.productId,

@@ -4,6 +4,7 @@ import { prisma } from '../lib/prisma.js'
 import { accessibleStoreIds, loadStoreAccess } from './permissions.js'
 import { normalizeMobileConfig } from './mobileConfig.js'
 import { money } from './money.js'
+import { promoUsage, serializePromo } from './promos.js'
 
 const TIERS = {
   Silver: [
@@ -71,7 +72,7 @@ export async function buildSnapshot(actor: AuthUser) {
       prisma.product.findMany({ where: storeFilter, include: { store: true }, orderBy: { name: 'asc' }, take: 200 }),
       prisma.order.findMany({
         where: storeFilter,
-        include: { customer: true, store: true, items: true, charges: true, activities: { orderBy: { createdAt: 'asc' } } },
+        include: { customer: true, store: true, rider: true, items: true, charges: true, activities: { orderBy: { createdAt: 'asc' } } },
         orderBy: { createdAt: 'desc' },
         take: 200,
       }),
@@ -237,6 +238,9 @@ export async function buildSnapshot(actor: AuthUser) {
       deliveryType: order.deliveryType,
       paymentLabel: order.paymentLabel,
       addressLine: order.addressLine,
+      riderId: order.riderId,
+      riderName: order.rider?.name ?? null,
+      riderPhone: order.rider?.phone ?? null,
       cancelReason: order.cancelReason,
       refundReason: order.refundReason,
       refundAmount: money(order.refundAmount),
@@ -399,13 +403,7 @@ export async function buildSnapshot(actor: AuthUser) {
       showOutOfStock: setting?.showOutOfStock ?? true,
     },
     mobileConfig: normalizeMobileConfig(setting?.mobileConfig),
-    promos: promos.map((promo) => ({
-      id: promo.id,
-      code: promo.code,
-      label: promo.label,
-      discount: money(promo.discount),
-      active: promo.active,
-    })),
+    promos: await Promise.all(promos.map(async (promo) => serializePromo(promo, await promoUsage(promo.id)))),
     payouts: payouts.map((payout) => ({
       id: payout.id,
       amount: money(payout.amount),

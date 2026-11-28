@@ -21,6 +21,7 @@ adminOrderRouter.get('/', async (_req: Request, res: Response, next: NextFunctio
           },
         },
         store: true,
+        rider: { select: { id: true, name: true, phone: true } },
         items: true,
         charges: true,
       },
@@ -41,6 +42,8 @@ adminOrderRouter.get('/', async (_req: Request, res: Response, next: NextFunctio
         deliveryType: order.deliveryType,
         paymentLabel: order.paymentLabel,
         addressLine: order.addressLine,
+        riderId: order.riderId,
+        riderName: order.rider?.name ?? null,
         total: money(order.total),
         itemCount: order.items.reduce(
           (sum, item) => sum + item.quantity,

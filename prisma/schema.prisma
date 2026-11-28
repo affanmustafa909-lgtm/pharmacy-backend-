@@ -89,6 +89,27 @@ model PromoCode {
   discount  Decimal  @db.Decimal(12, 2)
   active    Boolean  @default(true)
   createdAt DateTime @default(now())
+  // ADM-05: schedule, usage limits and store targeting
+  startsAt         DateTime?
+  endsAt           DateTime?
+  maxUses          Int?
+  perCustomerLimit Int?
+  storeIds         Json     @default("[]")
+  redemptions      PromoRedemption[]
+}
+
+model PromoRedemption {
+  id         String    @id @default(cuid())
+  promoId    String
+  orderId    String
+  customerId String
+  discount   Decimal   @db.Decimal(12, 2)
+  createdAt  DateTime  @default(now())
+  promo      PromoCode @relation(fields: [promoId], references: [id], onDelete: Cascade)
+  order      Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([promoId, customerId])
+  @@index([orderId])
 }
 
 model Store {
@@ -155,6 +176,7 @@ model Rider {
   active    Boolean  @default(true)
   createdAt DateTime @default(now())
   store     Store    @relation(fields: [storeId], references: [id], onDelete: Cascade)
+  orders    Order[]
 
   @@index([storeId, active])
 }
@@ -179,6 +201,7 @@ model Product {
   onlineSale        Boolean          @default(true)
   published         Boolean          @default(true)
   rxRequired        Boolean          @default(false)
+  controlled        Boolean          @default(false)
   lowStockAlerts    Boolean          @default(true)
   lowStockThreshold Int?
   createdAt         DateTime         @default(now())
@@ -384,6 +407,8 @@ model Order {
   addressLine        String          @default("")
   prescriptionNumber String          @default("")
   cancelReason       String          @default("")
+  riderId            String?
+  riderAssignedAt    DateTime?
   refundReason       String          @default("")
   refundAmount       Decimal         @default(0) @db.Decimal(12, 2)
   productSubtotal    Decimal         @db.Decimal(12, 2)
@@ -395,14 +420,17 @@ model Order {
   createdAt          DateTime        @default(now())
   customer           User            @relation(fields: [customerId], references: [id])
   store              Store           @relation(fields: [storeId], references: [id])
+  rider              Rider?          @relation(fields: [riderId], references: [id], onDelete: SetNull)
   activities         OrderActivity[]
   charges            OrderCharge[]
   items              OrderItem[]
+  promoRedemptions   PromoRedemption[]
 
   @@index([storeId, createdAt])
   @@index([customerId])
   @@index([status])
   @@index([paymentStatus])
+  @@index([riderId])
 }
 
 model OrderActivity {
@@ -671,4 +699,47 @@ enum PrescriptionStatus {
   rejected
 }
 
+enum ComplaintStatus {
+  open
+  in_review
+  responded
+  resolved
+  closed
+}
 
+model Complaint {
+  id             String          @id @default(cuid())
+  number         String          @unique
+  customerId     String?
+  customerName   String
+  storeId        String?
+  orderNumber    String          @default("")
+  category       String          @default("Other")
+  subject        String
+  description    String          @default("")
+  priority       String          @default("normal")
+  status         ComplaintStatus @default(open)
+  assignedToId   String?
+  assignedToName String          @default("")
+  resolution     String          @default("")
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  resolvedAt     DateTime?
+  closedAt       DateTime?
+  notes          ComplaintNote[]
+
+  @@index([status])
+  @@index([storeId])
+}
+
+model ComplaintNote {
+  id          String    @id @default(cuid())
+  complaintId String
+  author      String
+  kind        String
+  text        String
+  createdAt   DateTime  @default(now())
+  complaint   Complaint @relation(fields: [complaintId], references: [id], onDelete: Cascade)
+
+  @@index([complaintId, createdAt])
+}

@@ -50,7 +50,7 @@ customerOrderRouter.post('/quote', async (req, res, next) => {
       storeName: quoted.store.name,
       storeAddress: quoted.store.address,
       openUntil: quoted.store.openUntil,
-      requiresPrescription: quoted.lines.some((line) => line.product.rxRequired),
+      requiresPrescription: quoted.lines.some((line) => line.product.rxRequired || line.product.controlled),
     })
   } catch (error) {
     next(error instanceof z.ZodError ? new HttpError(400, error.issues[0]?.message || 'Check the order details') : error)
@@ -102,7 +102,7 @@ customerOrderRouter.post('/', async (req, res, next) => {
 customerOrderRouter.get('/mine', async (req, res) => {
   const orders = await prisma.order.findMany({
     where: { customerId: req.user!.id },
-    include: { items: true, charges: true, store: true },
+    include: { items: true, charges: true, store: true, rider: true },
     orderBy: { createdAt: 'desc' },
     take: 40,
   })
@@ -212,7 +212,7 @@ customerOrderRouter.get('/:number/receipt', async (req, res, next) => {
   try {
     const order = await prisma.order.findFirst({
       where: { number: req.params.number, customerId: req.user!.id },
-      include: { items: true, charges: true, store: true },
+      include: { items: true, charges: true, store: true, rider: true },
     })
     if (!order) throw new HttpError(404, 'Order not found')
     const detail = mapOrderDetail(order)
@@ -231,7 +231,7 @@ customerOrderRouter.get('/:number', async (req, res, next) => {
   try {
     const order = await prisma.order.findFirst({
       where: { number: req.params.number, customerId: req.user!.id },
-      include: { items: true, charges: true, store: true },
+      include: { items: true, charges: true, store: true, rider: true },
     })
     if (!order) throw new HttpError(404, 'Order not found')
     res.json(mapOrderDetail(order))

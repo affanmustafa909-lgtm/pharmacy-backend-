@@ -9,6 +9,7 @@ import { authRouter } from './routes/auth.js'
 import { addressRouter } from './routes/addresses.js'
 import { catalogRouter } from './routes/catalog.js'
 import { customerOrderRouter } from './routes/customerOrders.js'
+import { customerComplaintRouter } from './routes/customerComplaints.js'
 import { importRouter } from './routes/import.js'
 import { notificationRouter } from './routes/notifications.js'
 import { prescriptionRouter } from './routes/prescriptions.js'
@@ -17,6 +18,7 @@ import { reportRouter } from './routes/reports.js'
 import { teamRouter } from './routes/team.js'
 import { stockRouter } from './routes/stock.js'
 import { purchasingRouter } from './routes/purchasing.js'
+import { analyticsRouter } from './routes/analytics.js'
 export function createApp() {
   const app = express()
   app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }))
@@ -35,6 +37,7 @@ export function createApp() {
   app.use('/auth', authRouter)
   app.use('/catalog', catalogRouter)
   app.use('/orders', customerOrderRouter)
+  app.use('/complaints', customerComplaintRouter)
   app.use('/admin/orders', adminOrderRouter)
   app.use('/addresses', addressRouter)
   app.use('/reminders', reminderRouter)
@@ -44,6 +47,7 @@ export function createApp() {
   app.use('/admin/reports', reportRouter)
   app.use('/admin/stock', stockRouter)
   app.use('/admin/purchasing', purchasingRouter)
+app.use('/admin/analytics', analyticsRouter)
   app.use('/admin', teamRouter)
   app.use('/admin', adminRouter)
   app.use(errorHandler)

@@ -205,7 +205,19 @@ export async function previewRows(
   const byCode = new Map(stores.map((store) => [store.code.toLowerCase(), store]))
   const byId = new Map(stores.map((store) => [store.id, store]))
   const forcedStore = forcedStoreId ? byId.get(forcedStoreId) ?? null : null
-  const existing = await prisma.product.findMany({ select: { storeId: true, sku: true } })
+  // name + batch are used for the "one SKU / one batch = one medicine" rule (batch read is optional-safe).
+  type ExistingProduct = { storeId: string; sku: string; name: string; batch?: string | null }
+  let existing: ExistingProduct[]
+  try {
+    const select = { storeId: true, sku: true, name: true, batch: true } as unknown as { storeId: true; sku: true; name: true }
+    existing = (await prisma.product.findMany({ select })) as ExistingProduct[]
+  } catch {
+    existing = await prisma.product.findMany({ select: { storeId: true, sku: true, name: true } })
+  }
+  const norm = (value?: string | null) => (value ?? '').trim().toLowerCase()
+  const fileSkuOwner = new Map<string, string>()
+  const fileBatchOwner = new Map<string, string>()
+  const fileNameFirst = new Map<string, { sku: string; storeId: string }>()
   const existingKeys = new Set(existing.map((item) => `${item.storeId}:${item.sku.toLowerCase()}`))
   const seen = new Set<string>()
   let lastStoreCode = forcedStore?.code ?? ''
@@ -244,6 +256,45 @@ export async function previewRows(
     if (expiryRaw && !isValidExpiry(expiryRaw)) errors.push(`Expiry date "${expiryRaw}" is not readable (use YYYY-MM-DD or MM/YY)`)
     else if (expiry && isExpired(expiry)) errors.push('Expiry date is in the past')
     if (Number.isFinite(stock) && stock > 0 && !expiryRaw) errors.push('Expiry date is required when stock is above 0')
+    // SKU and batch belong to ONE medicine across ALL stores. The same medicine in another store
+    // must use the same SKU. (Same rules as the Medicines form.)
+    if (store && sku && name) {
+      const nameKey = norm(name)
+      const skuKey = sku.toLowerCase()
+      const batchKey = norm(read('batch'))
+      const storeName = (id: string) => byId.get(id)?.name ?? 'another store'
+
+      const skuOwner = existing.find((item) => item.sku.toLowerCase() === skuKey && norm(item.name) !== nameKey)
+      if (skuOwner) {
+        errors.push(`SKU ${sku} already belongs to "${skuOwner.name}" (${storeName(skuOwner.storeId)})`)
+      } else {
+        const prior = fileSkuOwner.get(skuKey)
+        if (prior && prior !== nameKey) errors.push(`SKU ${sku} is used for two different medicines in this file`)
+      }
+      if (!fileSkuOwner.has(skuKey)) fileSkuOwner.set(skuKey, nameKey)
+
+      if (batchKey) {
+        const batchOwner = existing.find((item) => norm(item.batch) === batchKey && norm(item.name) !== nameKey)
+        if (batchOwner) {
+          errors.push(`Batch ${read('batch')} already belongs to "${batchOwner.name}" (${storeName(batchOwner.storeId)})`)
+        } else {
+          const prior = fileBatchOwner.get(batchKey)
+          if (prior && prior !== nameKey) errors.push(`Batch ${read('batch')} is used for two different medicines in this file`)
+        }
+        if (!fileBatchOwner.has(batchKey)) fileBatchOwner.set(batchKey, nameKey)
+      }
+
+      const elsewhere = existing.filter((item) => item.storeId !== store.id && norm(item.name) === nameKey)
+      if (elsewhere.length > 0 && !elsewhere.some((item) => item.sku.toLowerCase() === skuKey)) {
+        errors.push(`"${elsewhere[0].name}" already exists in ${storeName(elsewhere[0].storeId)} with SKU ${elsewhere[0].sku}. Use the same SKU`)
+      } else {
+        const first = fileNameFirst.get(nameKey)
+        if (first && first.storeId !== store.id && first.sku !== skuKey) {
+          errors.push(`"${name}" uses a different SKU in another store in this file. Use the same SKU`)
+        }
+      }
+      if (!fileNameFirst.has(nameKey)) fileNameFirst.set(nameKey, { sku: skuKey, storeId: store.id })
+    }
     let duplicate = false
     if (store && sku) {
       const key = `${store.id}:${sku.toLowerCase()}`

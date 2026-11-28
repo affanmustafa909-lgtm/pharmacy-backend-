@@ -21,7 +21,9 @@ import {
   writeAudit,
 } from '../services/permissions.js'
 import { recordStockMovement } from '../services/inventory.js'
+import type { AuthUser } from '../lib/auth.js'
 import { buildSnapshot } from '../services/snapshot.js'
+import { assertPromoUsable, promoUsage, serializePromo } from '../services/promos.js'
 
 const uploadDir = path.resolve('uploads/products')
 fs.mkdirSync(uploadDir, { recursive: true })
@@ -59,6 +61,7 @@ const productInput = z.object({
   held: z.boolean().optional(),
   lowStockAlerts: z.boolean().optional(),
   imageUrl: z.string().max(500).optional(),
+  controlled: z.boolean().optional(),
 })
 
 const chargeInput = z.object({
@@ -148,6 +151,7 @@ adminRouter.get('/products', async (req, res, next) => {
       outOfStock: product.stock <= 0,
       rxRequired: product.rxRequired,
       lowStockAlerts: product.lowStockAlerts,
+      controlled: product.controlled,
       description: product.description,
       imageUrl: product.imageUrl,
     })),
@@ -193,7 +197,8 @@ adminRouter.post('/products', async (req, res, next) => {
         price: dec(body.price),
         unitLabel: body.unitLabel || '1 unit',
         stock: body.stock,
-        rxRequired: body.rxRequired ?? false,
+        rxRequired: (body.rxRequired ?? false) || (body.controlled ?? false),
+        controlled: body.controlled ?? false,
         description: body.description ?? 'Added from the admin catalog.',
         batch: body.batch ?? 'NEW-26',
         expiry: expiry ?? '2027-12-31',
@@ -272,6 +277,8 @@ adminRouter.patch('/products/:id', async (req, res, next) => {
         ...(patch.held != null ? { held: patch.held } : {}),
         ...(patch.lowStockAlerts != null ? { lowStockAlerts: patch.lowStockAlerts } : {}),
         ...(patch.imageUrl != null ? { imageUrl: patch.imageUrl } : {}),
+        ...(patch.controlled != null ? { controlled: patch.controlled } : {}),
+        ...(patch.controlled === true ? { rxRequired: true } : {}),
       },
     })
     if (stockChanged && patch.stock != null) {
@@ -658,6 +665,60 @@ adminRouter.delete('/riders/:id', async (req, res, next) => {
   }
 })
 
+adminRouter.post('/orders/:number/rider', async (req, res, next) => {
+  try {
+    const body = z.object({ riderId: z.string().min(1).nullable() }).parse(req.body)
+    const order = await prisma.order.findUnique({
+      where: { number: req.params.number },
+      include: { rider: true },
+    })
+    if (!order) throw new HttpError(404, 'Order not found')
+    const access = await assertStoreAccess(req.user!, order.storeId, {
+      roles: ['OWNER', 'STORE_MANAGER', 'ORDER_STAFF'],
+    })
+    if (!canManageOrders(access.deskRole) && req.user!.role !== 'ADMIN') {
+      throw new HttpError(403, 'Your role cannot assign riders')
+    }
+    if (order.deliveryType === 'pickup') throw new HttpError(400, 'Pickup orders do not need a rider')
+    if (order.status === 'delivered' || order.status === 'cancelled' || order.status === 'collected') {
+      throw new HttpError(400, `Rider cannot be changed on a ${order.status} order`)
+    }
+    let rider: { id: string; name: string } | null = null
+    if (body.riderId) {
+      const found = await prisma.rider.findUnique({ where: { id: body.riderId } })
+      if (!found || found.storeId !== order.storeId) throw new HttpError(400, 'This rider does not belong to the order\'s store')
+      if (!found.active) throw new HttpError(400, `${found.name} is off duty. Activate the rider first`)
+      rider = found
+    }
+    if ((order.riderId ?? null) === (rider?.id ?? null)) {
+      res.json({ ok: true, riderId: rider?.id ?? null, riderName: rider?.name ?? null })
+      return
+    }
+    await prisma.order.update({
+      where: { id: order.id },
+      data: { riderId: rider?.id ?? null, riderAssignedAt: rider ? new Date() : null },
+    })
+    await prisma.orderActivity.create({
+      data: {
+        orderId: order.id,
+        label: rider ? `Rider assigned → ${rider.name}` : 'Rider removed',
+        detail: order.rider && rider ? `Previously ${order.rider.name}` : order.rider ? `Was ${order.rider.name}` : '',
+        actor: req.user!.name,
+      },
+    })
+    await writeAudit({
+      actorId: req.user!.id,
+      storeId: order.storeId,
+      action: 'order.rider',
+      detail: rider ? `${order.number} assigned to ${rider.name}` : `${order.number} rider removed`,
+      meta: { order: order.number, riderId: rider?.id ?? null, previousRiderId: order.riderId ?? null },
+    })
+    res.json({ ok: true, riderId: rider?.id ?? null, riderName: rider?.name ?? null })
+  } catch (error) {
+    next(zodFail(error))
+  }
+})
+
 adminRouter.post('/orders/:number/status', async (req, res, next) => {
   try {
     const body = z
@@ -827,6 +888,9 @@ adminRouter.post('/prescriptions/:number/decision', async (req, res, next) => {
             where: { storeId: prescription.storeId, sku: item.sku },
           })
       if (!product) throw new HttpError(400, `${item.name} is not in this store catalog`)
+      if (product.controlled && body.status === 'approved' && !prescription.prescriber.trim()) {
+        throw new HttpError(400, `${product.name} is a controlled medicine. Prescriber name is required before approving.`)
+      }
       enrichedItems.push({
         productId: product.id,
         sku: product.sku,
@@ -1215,13 +1279,7 @@ adminRouter.get('/mobile-config', async (_req, res) => {
   const promos = await prisma.promoCode.findMany({ orderBy: { code: 'asc' } })
   res.json({
     config: normalizeMobileConfig(setting?.mobileConfig),
-    promos: promos.map((promo) => ({
-      id: promo.id,
-      code: promo.code,
-      label: promo.label,
-      discount: money(promo.discount),
-      active: promo.active,
-    })),
+    promos: await Promise.all(promos.map(async (promo) => serializePromo(promo, await promoUsage(promo.id)))),
   })
 })
 
@@ -1238,25 +1296,63 @@ adminRouter.put('/mobile-config', async (req, res, next) => {
   }
 })
 
+const promoDate = z
+  .string()
+  .nullable()
+  .optional()
+  .transform((value, ctx) => {
+    if (value == null || value === '') return null
+    const date = new Date(value)
+    if (Number.isNaN(date.getTime())) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Date is not valid' })
+      return z.NEVER
+    }
+    return date
+  })
+
+const promoFields = {
+  label: z.string().trim().min(1).max(120),
+  discount: z.number().min(0),
+  active: z.boolean(),
+  startsAt: promoDate,
+  endsAt: promoDate,
+  maxUses: z.number().int().min(1).nullable().optional(),
+  perCustomerLimit: z.number().int().min(1).nullable().optional(),
+  storeIds: z.array(z.string()).optional(),
+}
+
+async function checkPromoRules(user: AuthUser | undefined, d: { startsAt?: Date | null; endsAt?: Date | null; storeIds?: string[] }) {
+  if (d.startsAt && d.endsAt && d.endsAt <= d.startsAt) throw new HttpError(400, 'End date must be after the start date')
+  if (d.storeIds?.length) {
+    const found = await prisma.store.count({ where: { id: { in: d.storeIds } } })
+    if (found !== d.storeIds.length) throw new HttpError(400, 'One of the selected stores was not found')
+    for (const id of d.storeIds) await assertStoreAccess(user!, id)
+  }
+}
+
 adminRouter.post('/promos', async (req, res, next) => {
   try {
     const body = z
-      .object({
-        code: z.string().trim().min(2).max(40),
-        label: z.string().trim().min(1).max(120),
-        discount: z.number().min(0),
-        active: z.boolean().optional(),
-      })
+      .object({ code: z.string().trim().min(2).max(40), ...promoFields, active: promoFields.active.optional() })
       .parse(req.body)
-    await prisma.promoCode.create({
+    await checkPromoRules(req.user, body)
+    const code = body.code.toUpperCase()
+    if (await prisma.promoCode.findUnique({ where: { code } })) throw new HttpError(400, `Promo code ${code} already exists`)
+    const created = await prisma.promoCode.create({
       data: {
-        code: body.code.toUpperCase(),
+        code,
         label: body.label,
         discount: dec(body.discount),
         active: body.active ?? true,
+        startsAt: body.startsAt ?? null,
+        endsAt: body.endsAt ?? null,
+        maxUses: body.maxUses ?? null,
+        perCustomerLimit: body.perCustomerLimit ?? null,
+        storeIds: body.storeIds ?? [],
       },
     })
-    res.status(201).json({ ok: true })
+    await writeAudit({ actorId: req.user!.id, action: 'promo.create', detail: `Created promo ${created.code}`, meta: { code: created.code } })
+    res.status(201).json({ ok: true, id: created.id })
   } catch (error) {
     next(zodFail(error))
   }
@@ -1264,26 +1360,82 @@ adminRouter.post('/promos', async (req, res, next) => {
 
 adminRouter.patch('/promos/:id', async (req, res, next) => {
   try {
-    const body = z
-      .object({
-        label: z.string().trim().min(1).max(120).optional(),
-        discount: z.number().min(0).optional(),
-        active: z.boolean().optional(),
-      })
-      .parse(req.body)
+    const body = z.object(promoFields).partial().parse(req.body)
     const promo = await prisma.promoCode.findUnique({ where: { id: req.params.id } })
     if (!promo) throw new HttpError(404, 'Promo not found')
+    await checkPromoRules(req.user, {
+      startsAt: body.startsAt !== undefined ? body.startsAt : promo.startsAt,
+      endsAt: body.endsAt !== undefined ? body.endsAt : promo.endsAt,
+      storeIds: body.storeIds,
+    })
     await prisma.promoCode.update({
       where: { id: promo.id },
       data: {
         ...(body.label != null ? { label: body.label } : {}),
         ...(body.discount != null ? { discount: dec(body.discount) } : {}),
         ...(body.active != null ? { active: body.active } : {}),
+        ...(body.startsAt !== undefined ? { startsAt: body.startsAt } : {}),
+        ...(body.endsAt !== undefined ? { endsAt: body.endsAt } : {}),
+        ...(body.maxUses !== undefined ? { maxUses: body.maxUses } : {}),
+        ...(body.perCustomerLimit !== undefined ? { perCustomerLimit: body.perCustomerLimit } : {}),
+        ...(body.storeIds !== undefined ? { storeIds: body.storeIds } : {}),
       },
     })
+    await writeAudit({ actorId: req.user!.id, action: 'promo.update', detail: `Updated promo ${promo.code}`, meta: { code: promo.code } })
     res.status(204).end()
   } catch (error) {
     next(zodFail(error))
+  }
+})
+
+// Who used this promo, on which order, and how much discount was given.
+adminRouter.get('/promos/:id/redemptions', async (req, res, next) => {
+  try {
+    const promo = await prisma.promoCode.findUnique({ where: { id: req.params.id } })
+    if (!promo) throw new HttpError(404, 'Promo not found')
+    const rows = await prisma.promoRedemption.findMany({
+      where: { promoId: promo.id },
+      include: { order: { include: { customer: true, store: true } } },
+      orderBy: { createdAt: 'desc' },
+      take: 200,
+    })
+    const valid = rows.filter((row) => row.order.status !== 'cancelled')
+    res.json({
+      code: promo.code,
+      used: valid.length,
+      totalDiscount: Math.round(valid.reduce((sum, row) => sum + money(row.discount), 0) * 100) / 100,
+      items: rows.map((row) => ({
+        id: row.id,
+        orderNumber: row.order.number,
+        customerName: row.order.customer.name,
+        storeName: row.order.store.name,
+        discount: money(row.discount),
+        orderStatus: row.order.status,
+        counted: row.order.status !== 'cancelled',
+        createdAt: row.createdAt.toISOString(),
+      })),
+    })
+  } catch (error) {
+    next(error)
+  }
+})
+
+// Would this code work for this store right now?
+adminRouter.get('/promos/:id/check', async (req, res, next) => {
+  try {
+    const storeId = String(req.query.storeId ?? '')
+    if (!storeId) throw new HttpError(400, 'Choose a store')
+    const promo = await prisma.promoCode.findUnique({ where: { id: req.params.id } })
+    if (!promo) throw new HttpError(404, 'Promo not found')
+    try {
+      await assertPromoUsable(promo, { storeId })
+      res.json({ eligible: true, discount: money(promo.discount), reason: '' })
+    } catch (error) {
+      if (error instanceof HttpError) return void res.json({ eligible: false, discount: 0, reason: error.message })
+      throw error
+    }
+  } catch (error) {
+    next(error)
   }
 })
 
@@ -1377,5 +1529,245 @@ adminRouter.post('/payouts', async (req, res, next) => {
     res.status(204).end()
   } catch (error) {
     next(zodFail(error))
+  }
+})
+
+// ===== ADM-01: Complaints =====
+const complaintFlow: Record<string, string[]> = {
+  open: ['in_review', 'responded', 'resolved'],
+  in_review: ['responded', 'resolved'],
+  responded: ['in_review', 'resolved'],
+  resolved: ['closed', 'in_review'],
+  closed: [],
+}
+
+async function complaintScope(user: Parameters<typeof accessibleStoreIds>[0]) {
+  const allowed = await accessibleStoreIds(user)
+  return allowed ? { storeId: { in: allowed.length ? allowed : ['__none__'] } } : {}
+}
+
+adminRouter.get('/complaints/staff', async (_req, res, next) => {
+  try {
+    const staff = await prisma.user.findMany({
+      where: { role: { in: ['ADMIN', 'STAFF'] } },
+      select: { id: true, name: true },
+      orderBy: { name: 'asc' },
+    })
+    res.json({ staff })
+  } catch (error) {
+    next(error)
+  }
+})
+
+adminRouter.get('/complaints', async (req, res, next) => {
+  try {
+    const status = String(req.query.status ?? '')
+    const q = String(req.query.q ?? '').trim()
+    const scope = await complaintScope(req.user!)
+    const items = await prisma.complaint.findMany({
+      where: {
+        ...scope,
+        ...(status ? { status: status as 'open' } : {}),
+        ...(q
+          ? {
+              OR: [
+                { number: { contains: q, mode: 'insensitive' } },
+                { customerName: { contains: q, mode: 'insensitive' } },
+                { orderNumber: { contains: q, mode: 'insensitive' } },
+                { subject: { contains: q, mode: 'insensitive' } },
+              ],
+            }
+          : {}),
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 200,
+    })
+    const grouped = await prisma.complaint.groupBy({ by: ['status'], where: scope, _count: true })
+    res.json({ items, counts: Object.fromEntries(grouped.map((row) => [row.status, row._count])) })
+  } catch (error) {
+    next(error)
+  }
+})
+
+adminRouter.get('/complaints/:id', async (req, res, next) => {
+  try {
+    const scope = await complaintScope(req.user!)
+    const item = await prisma.complaint.findFirst({
+      where: { id: req.params.id, ...scope },
+      include: { notes: { orderBy: { createdAt: 'asc' } } },
+    })
+    if (!item) throw new HttpError(404, 'Complaint not found')
+    res.json(item)
+  } catch (error) {
+    next(error)
+  }
+})
+
+adminRouter.post('/complaints', async (req, res, next) => {
+  try {
+    const body = z
+      .object({
+        customerName: z.string().trim().max(80).optional(),
+        orderNumber: z.string().trim().max(40).optional(),
+        storeId: z.string().optional(),
+        category: z.string().trim().max(40).optional(),
+        subject: z.string().trim().min(3, 'Write a short subject').max(120),
+        description: z.string().trim().max(1000).optional(),
+        priority: z.enum(['low', 'normal', 'high']).optional(),
+      })
+      .parse(req.body)
+    let storeId: string | null = body.storeId || null
+    let customerId: string | null = null
+    let customerName = body.customerName || ''
+    if (body.orderNumber) {
+      const order = await prisma.order.findUnique({ where: { number: body.orderNumber }, include: { customer: true } })
+      if (!order) throw new HttpError(400, `Order ${body.orderNumber} was not found`)
+      await assertStoreAccess(req.user!, order.storeId)
+      storeId = order.storeId
+      customerId = order.customerId
+      customerName = customerName || order.customer.name
+    }
+    if (!customerName) throw new HttpError(400, 'Enter the customer name or an order number')
+    if (storeId) await assertStoreAccess(req.user!, storeId)
+    const count = await prisma.complaint.count()
+    const created = await prisma.complaint.create({
+      data: {
+        number: `CMP-${1000 + count + 1}`,
+        customerId,
+        customerName,
+        storeId,
+        orderNumber: body.orderNumber ?? '',
+        category: body.category || 'Other',
+        subject: body.subject,
+        description: body.description ?? '',
+        priority: body.priority ?? 'normal',
+        notes: { create: [{ author: req.user!.name, kind: 'status', text: 'Complaint logged' }] },
+      },
+    })
+    await writeAudit({ actorId: req.user!.id, storeId, action: 'complaint.create', detail: `${created.number}: ${created.subject}` })
+    res.status(201).json({ id: created.id, number: created.number })
+  } catch (error) {
+    next(zodFail(error))
+  }
+})
+
+adminRouter.patch('/complaints/:id', async (req, res, next) => {
+  try {
+    const body = z
+      .object({
+        status: z.enum(['open', 'in_review', 'responded', 'resolved', 'closed']).optional(),
+        priority: z.enum(['low', 'normal', 'high']).optional(),
+        assignedToId: z.string().nullable().optional(),
+        resolution: z.string().trim().max(1000).optional(),
+      })
+      .parse(req.body)
+    const scope = await complaintScope(req.user!)
+    const c = await prisma.complaint.findFirst({ where: { id: req.params.id, ...scope } })
+    if (!c) throw new HttpError(404, 'Complaint not found')
+    if (c.status === 'closed') throw new HttpError(400, 'This complaint is closed')
+    if (c.storeId) await assertStoreAccess(req.user!, c.storeId)
+
+    const data: Prisma.ComplaintUpdateInput = {}
+    const notes: { author: string; kind: string; text: string }[] = []
+    let nextStatus = body.status
+
+    if (body.assignedToId !== undefined) {
+      if (body.assignedToId === null) {
+        data.assignedToId = null
+        data.assignedToName = ''
+        notes.push({ author: req.user!.name, kind: 'status', text: 'Unassigned' })
+      } else {
+        const staff = await prisma.user.findFirst({ where: { id: body.assignedToId, role: { in: ['ADMIN', 'STAFF'] } } })
+        if (!staff) throw new HttpError(400, 'Choose a staff member')
+        data.assignedToId = staff.id
+        data.assignedToName = staff.name
+        notes.push({ author: req.user!.name, kind: 'status', text: `Assigned to ${staff.name}` })
+        if (c.status === 'open' && !nextStatus) nextStatus = 'in_review'
+      }
+    }
+    if (body.priority && body.priority !== c.priority) {
+      data.priority = body.priority
+      notes.push({ author: req.user!.name, kind: 'status', text: `Priority: ${body.priority}` })
+    }
+    if (body.resolution !== undefined) data.resolution = body.resolution
+    if (nextStatus && nextStatus !== c.status) {
+      if (!complaintFlow[c.status].includes(nextStatus)) {
+        throw new HttpError(400, `Cannot move from ${c.status.replace('_', ' ')} to ${nextStatus.replace('_', ' ')}`)
+      }
+      if (nextStatus === 'resolved' && !(body.resolution ?? c.resolution).trim()) {
+        throw new HttpError(400, 'Write the resolution before marking this complaint resolved')
+      }
+      data.status = nextStatus
+      if (nextStatus === 'resolved') data.resolvedAt = new Date()
+      if (nextStatus === 'closed') data.closedAt = new Date()
+      notes.push({ author: req.user!.name, kind: 'status', text: `Status: ${nextStatus.replace('_', ' ')}` })
+      if (c.customerId && (nextStatus === 'resolved' || nextStatus === 'closed')) {
+        await notifyCustomer({
+          customerId: c.customerId,
+          type: 'complaint',
+          title: nextStatus === 'resolved' ? 'Complaint resolved' : 'Complaint closed',
+          body: `${c.number}: ${(body.resolution ?? c.resolution) || c.subject}`,
+          data: { complaint: c.number },
+        })
+      }
+    }
+    await prisma.complaint.update({ where: { id: c.id }, data: { ...data, ...(notes.length ? { notes: { create: notes } } : {}) } })
+    await writeAudit({ actorId: req.user!.id, storeId: c.storeId, action: 'complaint.update', detail: `${c.number} updated` })
+    res.status(204).end()
+  } catch (error) {
+    next(zodFail(error))
+  }
+})
+
+adminRouter.post('/complaints/:id/notes', async (req, res, next) => {
+  try {
+    const body = z
+      .object({ text: z.string().trim().min(1, 'Write a message').max(1000), kind: z.enum(['response', 'internal']) })
+      .parse(req.body)
+    const scope = await complaintScope(req.user!)
+    const c = await prisma.complaint.findFirst({ where: { id: req.params.id, ...scope } })
+    if (!c) throw new HttpError(404, 'Complaint not found')
+    if (c.status === 'closed') throw new HttpError(400, 'This complaint is closed')
+    await prisma.complaintNote.create({ data: { complaintId: c.id, author: req.user!.name, kind: body.kind, text: body.text } })
+    if (body.kind === 'response') {
+      if (c.status === 'open' || c.status === 'in_review') {
+        await prisma.complaint.update({ where: { id: c.id }, data: { status: 'responded' } })
+      }
+      if (c.customerId) {
+        await notifyCustomer({
+          customerId: c.customerId,
+          type: 'complaint',
+          title: 'Reply to your complaint',
+          body: body.text,
+          data: { complaint: c.number },
+        })
+      }
+    }
+    res.status(204).end()
+  } catch (error) {
+    next(zodFail(error))
+  }
+})
+
+// ===== ADM-02: Controlled drugs =====
+adminRouter.get('/compliance', async (req, res, next) => {
+  try {
+    const allowed = await accessibleStoreIds(req.user!)
+    const storeFilter = allowed ? { storeId: { in: allowed.length ? allowed : ['__none__'] } } : {}
+    const [products, sales] = await Promise.all([
+      prisma.product.findMany({ where: { ...storeFilter, controlled: true }, include: { store: true }, orderBy: { name: 'asc' } }),
+      prisma.auditLog.findMany({
+        where: { ...storeFilter, action: 'controlled.sale' },
+        include: { store: true },
+        orderBy: { createdAt: 'desc' },
+        take: 50,
+      }),
+    ])
+    res.json({
+      products: products.map((p) => ({ id: p.id, name: p.name, sku: p.sku, storeName: p.store.name, stock: p.stock })),
+      sales: sales.map((s) => ({ id: s.id, detail: s.detail, storeName: s.store?.name ?? '', createdAt: s.createdAt.toISOString() })),
+    })
+  } catch (error) {
+    next(error)
   }
 })
